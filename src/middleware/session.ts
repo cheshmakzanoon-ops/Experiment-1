@@ -14,14 +14,27 @@
  * requests carry it automatically. No secret ever reaches frontend JS, and
  * no secret ever appears in a URL.
  *
+ * Sessions are an ACTIVE ALLOWLIST persisted in src/services/sessionStore.ts
+ * (never an evicting revoked-token blacklist): issuance persists the new
+ * {sid, exp} record before the cookie is set, logout persists its removal
+ * before success is reported, and token verification requires a matching
+ * stored epoch + active record — so logout survives server restarts that
+ * keep the same storage. Storage failures fail closed
+ * (AUTH_STORAGE_UNAVAILABLE), never false success.
+ *
  * Cookie value: `base64url(payload).base64url(hmacSha256(payload))` where
- * payload is `{ exp, sid }`. The signing secret (SESSION_SECRET) never
- * leaves the server.
+ * payload is `{ v:2, epoch, sid, exp }` and exp is ms epoch. The signing
+ * secret (SESSION_SECRET) never leaves the server.
  */
 
 import type { Context, MiddlewareHandler } from 'hono'
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { config } from '../config.js'
+import {
+  sessionStore,
+  isValidSid,
+  SessionStoreError
+} from '../services/sessionStore.js'
 
 export const SESSION_COOKIE = 'ft_session'
 export const SESSION_ID_HEADER = 'x-session-id' // set on authenticated responses (never the secret)
@@ -36,63 +49,14 @@ export function sessionTokenLifetimeMs(): number {
   return Math.max(1, config.sessionTtlDays) * 24 * 60 * 60 * 1000
 }
 
-// ---------------------------------------------------------------------------
-// Server-side revocation (logout). Signed tokens are stateless, so simply
-// expiring the cookie client-side is not enough — a copied cookie would
-// still verify. This bounded in-memory list marks logged-out session ids
-// invalid until their natural expiry. Sizes are capped and pruned lazily;
-// a restart clears it (acceptable: cookies also die with the process).
-// ---------------------------------------------------------------------------
-
-const REVOKED_MAX = 5000
-const revokedSids = new Map<string, number>() // sid → exp(ms)
-let lastRevokePrune = Date.now()
-
-function pruneRevoked(now: number): void {
-  if (now - lastRevokePrune < 60_000) return
-  lastRevokePrune = now
-  for (const [sid, exp] of revokedSids) {
-    if (exp <= now) revokedSids.delete(sid)
-  }
-}
-
-function markRevoked(sid: string, exp: number): void {
-  pruneRevoked(Date.now())
-  if (revokedSids.size >= REVOKED_MAX) {
-    // Evict the soonest-to-expire entry to stay bounded.
-    let soonest = Infinity
-    let soonestSid: string | null = null
-    for (const [s, e] of revokedSids) {
-      if (e < soonest) {
-        soonest = e
-        soonestSid = s
-      }
-    }
-    if (soonestSid) revokedSids.delete(soonestSid)
-  }
-  revokedSids.set(sid, exp)
-}
-
-function isRevoked(sid: string, now: number): boolean {
-  const exp = revokedSids.get(sid)
-  if (exp === undefined) return false
-  if (exp <= now) {
-    revokedSids.delete(sid)
-    return false
-  }
-  return true
-}
-
-/** Invalidate a token server-side (used by logout). */
-export function revokeSessionToken(raw: string | undefined | null): void {
-  const payload = verifySessionToken(raw)
-  if (payload) markRevoked(payload.sid, payload.exp)
-}
-
 interface SessionPayload {
+  /** Payload version (2 = persistent-allowlist era). */
+  v: 2
+  /** Store epoch (hex) the session was issued under. */
+  epoch: string
   /** Expiry (ms epoch). */
   exp: number
-  /** Random session nonce (rotation, future revocation). */
+  /** Random session nonce (the allowlist key). */
   sid: string
 }
 
@@ -120,23 +84,53 @@ export function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(aBuf, bBuf)
 }
 
-export function issueSessionToken(now = Date.now()): string {
+/**
+ * Issue a session token ASYNCHRONOUSLY: the active-session record is
+ * persisted first; only a successfully committed record receives a cookie.
+ * Rejects with SessionStoreError (→ AUTH_STORAGE_UNAVAILABLE) when storage
+ * is unavailable.
+ */
+export async function issueSessionToken(now = Date.now()): Promise<string> {
+  const epoch = sessionStore.getEpoch()
+  if (!epoch) {
+    throw new SessionStoreError('Session store is not ready', 'AUTH_STORAGE_UNAVAILABLE')
+  }
   const payload: SessionPayload = {
+    v: 2,
+    epoch,
     exp: now + sessionTokenLifetimeMs(),
-    // Unpredictable per-session nonce (never Math.random) — revocation and
-    // future rotation rely on it being unguessable.
+    // Unpredictable per-session nonce (never Math.random) — the allowlist
+    // and logout revocation rely on it being unguessable.
     sid: randomBytes(18).toString('base64url')
   }
+  // Persist BEFORE issuing the cookie (never hand out an unpersisted
+  // session that verification would reject or a crash would lose).
+  await sessionStore.add(payload.sid, payload.exp)
   const encoded = base64urlEncode(JSON.stringify(payload))
   return `${encoded}.${sign(encoded)}`
 }
 
 /**
- * Verify a cookie value. Returns null when malformed/expired/tampered.
- * Verifying involves only local HMAC — no I/O.
+ * Revoke a session token ASYNCHRONOUSLY: removal is persisted before the
+ * logout response returns. An invalid/expired token is a harmless no-op
+ * (there is nothing active to remove). Storage failure propagates.
+ */
+export async function revokeSessionToken(raw: string | undefined | null): Promise<void> {
+  const payload = verifySessionToken(raw)
+  if (!payload) return
+  await sessionStore.remove(payload.sid)
+}
+
+/**
+ * Verify a cookie value synchronously. Returns null when
+ * malformed/expired/tampered, when the epoch does not match the store, or
+ * when the sid is not an active allowlist entry. Verification is local
+ * (HMAC + in-memory membership) — no I/O.
  */
 export function verifySessionToken(raw: string | undefined | null): SessionPayload | null {
   if (!raw) return null
+  // Oversized cookie values are rejected outright (defense in depth).
+  if (raw.length > 4096) return null
   const dot = raw.indexOf('.')
   if (dot <= 0 || dot >= raw.length - 1) return null
 
@@ -155,10 +149,17 @@ export function verifySessionToken(raw: string | undefined | null): SessionPaylo
   } catch {
     return null
   }
-  if (!payload || typeof payload.exp !== 'number' || !Number.isFinite(payload.exp)) return null
+  if (!payload || typeof payload !== 'object') return null
+  // Versioned payload: only the current allowlist format verifies.
+  if (payload.v !== 2) return null
+  if (typeof payload.epoch !== 'string' || !/^[0-9a-f]{64}$/.test(payload.epoch)) return null
+  if (typeof payload.sid !== 'string' || !isValidSid(payload.sid)) return null
+  if (typeof payload.exp !== 'number' || !Number.isSafeInteger(payload.exp)) return null
   const now = Date.now()
   if (payload.exp <= now) return null
-  if (isRevoked(payload.sid, now)) return null
+  // Active allowlist membership with an exact expiry match.
+  if (sessionStore.getEpoch() !== payload.epoch) return null
+  if (!sessionStore.has(payload.sid, payload.exp)) return null
   return payload
 }
 
@@ -186,7 +187,7 @@ export function clearSessionCookie(c: Context): void {
   c.header('Set-Cookie', cookieAttributes('', secure, 0))
 }
 
-/** Read the session cookie value from the request. */
+/** Read the session cookie value from the request (null on malformed). */
 export function readSessionToken(c: Context): string | null {
   const cookieHeader = c.req.header('cookie')
   if (!cookieHeader) return null
@@ -194,22 +195,24 @@ export function readSessionToken(c: Context): string | null {
   for (const part of cookieHeader.split(';')) {
     const trimmed = part.trim()
     if (trimmed.startsWith(prefix)) {
-      return decodeURIComponent(trimmed.slice(prefix.length))
+      try {
+        return decodeURIComponent(trimmed.slice(prefix.length))
+      } catch {
+        // Malformed percent-encoding is an invalid cookie, not a server bug.
+        return null
+      }
     }
   }
   return null
 }
 
 /**
- * True when session enforcement is off: explicit AUTH_DISABLED=true, or a
- * non-production process that has not configured either secret (an explicit,
- * loudly-logged development default — production without secrets fails
- * startup instead, see config.ts assertValidConfig).
+ * True only when the operator explicitly disabled authentication with the
+ * validated loopback-only development flag. Missing development secrets no
+ * longer open the application — auth fails CLOSED everywhere else.
  */
 export function authIsDisabled(): boolean {
-  if (config.authDisabled) return true
-  if (config.nodeEnv === 'production') return false
-  return !config.accessKey || !config.sessionSecret
+  return config.authDisabled
 }
 
 /** True when the request carries a valid session. */
@@ -254,3 +257,5 @@ export function requireSession(): MiddlewareHandler {
     await next()
   }
 }
+
+export { SessionStoreError }

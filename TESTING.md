@@ -24,17 +24,43 @@ From the project root:
 ```bash
 npm ci
 npm run lint              # frontend ESLint (catches undefined identifiers)
-npm test                  # Vitest suite (Range, auth, URL safety, feeds, yt-dlp)
+npm run typecheck         # tsc -b --noEmit
+npm test                  # Vitest suite — 17 files / ~200 tests
 npm run build             # TypeScript build
 npm run bootstrap:runtime # idempotent pinned yt-dlp install (+ SHA-256 verify)
+node scripts/ensure-runtime.mjs   # idempotent: re-hash against the receipt; run twice to
+node scripts/ensure-runtime.mjs   # prove the second invocation downloads nothing
 ```
 
-Then start a server on a non-default port and exercise it locally:
+The Vitest suite covers: fail-closed configuration + strict `AUTH_DISABLED`
+parsing (`config-failclosed`, `auth-disabled`), session auth incl. the
+persistent session store (`session-auth`, `session-ttl`, `session-store` —
+restart survival, epoch rotation, corruption fail-closed, capacity 503,
+write-failure unavailability, revoked-cookie replay after restart),
+the offline downloader contract on `fake-indexeddb` (`offline-download`),
+single-flight cancellation with independent waiters + a real
+SIGTERM-ignoring child fixture (`ytdlp-cancellation`), ordered shutdown
+fencing (`shutdown`), the pinned-runtime installer with mocked network
+(`runtime-bootstrap`), the smoke acceptance gates (`smoke`), and the
+service-worker namespace-scoped cache policy (`sw-policy`).
+
+Then start a server on a non-default port and exercise it locally
+(credentials must meet the minimums: `ACCESS_KEY` ≥ 16 chars,
+`SESSION_SECRET` ≥ 32 UTF-8 bytes):
 
 ```bash
-PORT=3457 ACCESS_KEY=test-key SESSION_SECRET=test-secret-please-change \
+PORT=3457 ACCESS_KEY=test-key-16chars-ok SESSION_SECRET=test-secret-please-change-32bytes \
   NODE_ENV=production node dist/index.js
 ```
+
+Sessions persist to `.runtime/auth/sessions.json` (override:
+`SESSION_STORE_PATH`). To verify restart survival: log in, stop the
+server, start it again with the same `SESSION_SECRET`, and confirm the old
+cookie still authenticates. Deleting that file (or a fresh Freebuff
+rebuild that resets ephemeral storage) rotates the store epoch — every old
+cookie is then invalid and exactly one fresh login is required. A
+corrupted/malformed store file fails startup; it is never silently
+replaced.
 
 ```bash
 curl -s http://127.0.0.1:3457/api/health/live     # 200 {"status":"ok"}
@@ -102,7 +128,7 @@ smoke test never downloads a whole video.
 | Exit | Verdict | Meaning / action |
 | --- | --- | --- |
 | 0 | PASS | app healthy over the real ingress |
-| 1 | FAIL (freebuff_ingress / auth / runtime_missing / range_corruption) | an application-level defect — fix and re-run |
+| 1 | FAIL (freebuff_ingress / auth / runtime_missing / version_mismatch / shutting_down / range_corruption) | an application-level defect — fix and re-run |
 | 2 | APPLICATION HEALTHY — YouTube/EGRESS blocked | external: Freebuff’s egress IP is rejected by YouTube (or the CDN). Retries won’t fix it; a controlled proxy (`YT_PROXY_URL`) or different host is required |
 
 `runtime_missing` means the pinned yt-dlp runtime was not established on
@@ -141,8 +167,21 @@ cannot even start then).
       completed chunk, never restart from zero.
 - [ ] Install the debug APK (`./build-apk.sh "https://…"`), verify
       playback, back button, offline page, and the native share sheet.
+- [ ] Service-worker upgrade check in an ALREADY-USED profile (do not clear
+      IndexedDB): load the app with the previous shell cached, deploy this
+      release (cache generation v2 → v3), reload — the worker must update
+      and the repaired JS must run. Go offline and reload (offline playback
+      from existing IndexedDB chunks must still work), then restore the
+      network and confirm login + a fresh download use the new
+      implementation. Expect exactly one fresh login after the deployment
+      (the session-store epoch is new on a rebuilt host).
 - [ ] Confirm a deep link `familytube://watch?v=<11-char-id>` opens the
       app and an injected/garbage id is ignored.
+- [ ] Slow-network behavior: throttle the client, start an offline download,
+      drop it mid-chunk, resume — progress continues from the last
+      committed chunk; a source change (re-extraction of a different
+      representation) restarts at most once and then pauses with an
+      explicit `SOURCE_CHANGED` error in the UI.
 - [ ] Final release build: `./gradlew assembleRelease -PWEBAPP_URL="https://…"`
       — must fail when the URL is missing/HTTP/localhost (validated in
       `android/app/build.gradle`).

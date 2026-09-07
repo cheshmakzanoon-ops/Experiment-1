@@ -28,12 +28,17 @@
 
 import {
     CORE_PATHS,
+    cachesToDelete,
     isNeverCacheablePath,
     shouldHandleApiRequest,
     responseIsCacheable
 } from './js/sw-policy.js';
 
-const VERSION = 'v2';
+// Bump VERSION when a release changes the JS/CSS the shell precaches — the
+// next install precaches the new shell under the new generation and the
+// activate handler removes ONLY this application's older yt-core-/yt-
+// runtime- generations (never unrelated same-origin caches, never IndexedDB).
+const VERSION = 'v3';
 const CORE_CACHE = `yt-core-${VERSION}`;
 const RUNTIME_CACHE = `yt-runtime-${VERSION}`;
 
@@ -54,13 +59,8 @@ self.addEventListener('activate', (event) => {
     event.waitUntil(
         caches
             .keys()
-            .then((keys) =>
-                Promise.all(
-                    keys
-                        .filter((key) => key !== CORE_CACHE && key !== RUNTIME_CACHE)
-                        .map((key) => caches.delete(key))
-                )
-            )
+            .then((keys) => cachesToDelete(keys, { core: CORE_CACHE, runtime: RUNTIME_CACHE }))
+            .then((stale) => Promise.all(stale.map((key) => caches.delete(key))))
             .then(() => self.clients.claim())
     );
 });

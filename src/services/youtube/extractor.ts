@@ -12,6 +12,7 @@
  */
 
 import { runYtDlp, YtDlpError, publicMessageFor } from '../ytdlp/runYtDlp.js'
+import { isAbortError } from '../ytdlp/queue.js'
 import type { VideoFormat, VideoMetadata } from '../../types/video.js'
 
 /** Quality presets the app exposes (everything above 144–480 is out of scope). */
@@ -84,7 +85,10 @@ export interface SelectedStream {
   url: string
   quality: string
   mimeType: string
+  /** Exact authoritative size when the extractor reports one (never `filesize_approx`). */
   filesize?: number
+  /** Extractors estimate sizes; an estimate must never gate ranges/completion. */
+  filesizeApprox?: number
   height?: number
   width?: number
   hasAudio: boolean
@@ -98,7 +102,29 @@ const VIDEO_URL = (videoId: string): string => `https://www.youtube.com/watch?v=
 // Raw extraction (bounded retry policy only)
 // ---------------------------------------------------------------------------
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function abortIfRequested(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError')
+  }
+}
 
 /**
  * One raw `--dump-single-json` extraction attempt. Throws YtDlpError on
@@ -110,6 +136,7 @@ async function rawInfoAttempt(
   signal?: AbortSignal,
   extraArgs: string[] = []
 ): Promise<YtDlpVideoInfo> {
+  abortIfRequested(signal)
   const args = [
     '--dump-single-json',
     '--no-playlist',
@@ -151,6 +178,8 @@ export async function extractRawInfo(
     try {
       return await rawInfoAttempt(videoId, options.signal)
     } catch (error) {
+      // Cancellation is NEVER retried and never wrapped as an unknown error.
+      if (isAbortError(error)) throw error
       const err = error instanceof YtDlpError ? error : new YtDlpError('Extraction failed', 'unknown', { originalError: error })
       lastError = err
       // Never retry permanent categories (404/private/geo/DRM/format,
@@ -159,7 +188,12 @@ export async function extractRawInfo(
         throw err
       }
       const jittered = 800 + Math.round(Math.random() * 1200)
-      await sleep(jittered)
+      try {
+        await sleep(jittered, options.signal)
+      } catch (sleepError) {
+        if (isAbortError(sleepError)) throw sleepError
+        throw err
+      }
     }
   }
 
@@ -223,7 +257,12 @@ function toSelectedStream(f: YtDlpFormat, hasAv: boolean): SelectedStream {
     url: f.url as string,
     quality: height ? `${height}p` : f.format_note || 'auto',
     mimeType: getMimeType(f.ext || 'mp4'),
-    filesize: f.filesize || f.filesize_approx,
+    // Only an exact `filesize` is authoritative. `filesize_approx` is an
+    // estimate: kept aside, never promoted into range decisions,
+    // Content-Length, or completion metadata (the proxy learns the true
+    // total from CDN range responses).
+    filesize: f.filesize,
+    filesizeApprox: f.filesize_approx,
     height,
     width: f.width,
     hasAudio: hasAv && hasAudio(f),
@@ -314,7 +353,9 @@ export async function extractPlayableVideo(
   maxHeight = 240,
   options: { signal?: AbortSignal; extraArgs?: string[] } = {}
 ): Promise<ExtractionResult> {
+  abortIfRequested(options.signal)
   const info = await extractRawInfo(videoId, { signal: options.signal })
+  abortIfRequested(options.signal)
 
   if (info.is_live || info.live_status === 'is_live') {
     throw new YtDlpError('Live streams are not supported yet', 'live_stream')

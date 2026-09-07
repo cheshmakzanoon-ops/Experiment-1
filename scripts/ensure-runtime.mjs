@@ -1,11 +1,20 @@
 #!/usr/bin/env node
 /**
- * ensure-runtime.mjs — idempotent runtime verification used by `prestart`.
+ * ensure-runtime.mjs — idempotent runtime verification used by `prestart`
+ * and by direct server startup (src/index.ts spawns this same script as a
+ * bounded child before probing).
  *
- *   - When YT_DLP_PATH is set, only validates that the binary answers
- *     `--version` (the operator owns that install).
- *   - Otherwise it verifies the repository-local .runtime/bin/yt-dlp and
- *     bootstraps it (with SHA-256 verification) when missing or stale.
+ *   - One effective requested version: trimmed YT_DLP_VERSION, otherwise
+ *     src/config/ytdlp-version.json `defaultVersion` (release-tag syntax
+ *     validated).
+ *   - YT_DLP_PATH (operator-managed): REQUIRES an absolute executable path
+ *     AND an exact effective-version match; the operator's file is never
+ *     overwritten and no official checksum verification is claimed for it.
+ *   - Otherwise the MANAGED repository-local binary
+ *     (.runtime/bin/yt-dlp[.exe]) must exist with the EXACT requested
+ *     version, executable permissions and a matching SHA-256 (receipt, or
+ *     the official checksum manifest when the receipt is absent). Missing
+ *     or wrong → install from the pinned official release.
  *
  * A second invocation never re-downloads a valid installed binary.
  *
@@ -13,65 +22,141 @@
  */
 
 import { existsSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import {
+  binaryNameFor,
+  binaryPathFor,
+  effectiveRequestedVersion,
+  installPinnedRuntime,
+  parseRequestedVersion,
+  probeVersionFile,
+  projectRoot
+} from './bootstrap-runtime.mjs'
 
-const scriptDir = dirname(fileURLToPath(import.meta.url))
-const projectRoot = resolve(scriptDir, '..')
-const quiet = process.argv.includes('--quiet')
-const log = quiet ? () => {} : (msg) => console.log(msg)
+// Re-export for tests/importing tooling.
+export { projectRoot, parseRequestedVersion, binaryPathFor, binaryNameFor }
 
-function versionOf(command) {
-  const result = spawnSync(command, ['--version'], { encoding: 'utf8', timeout: 10_000 })
-  if (result.error || result.status !== 0) return null
-  const version = (result.stdout || '').trim()
-  return version || null
-}
-
-async function main() {
-  const explicit = process.env.YT_DLP_PATH
-  if (explicit) {
-    const version = versionOf(explicit)
-    if (version) {
-      log(`[runtime] YT_DLP_PATH resolves (yt-dlp ${version}).`)
-      process.exit(0)
+/**
+ * Verify an operator-provided YT_DLP_PATH. The file must be an absolute,
+ * executable path answering --version with EXACTLY the effective requested
+ * version. Never modified; never claimed as official-checksum-verified.
+ */
+export function verifyExplicitPath(
+  explicitPath,
+  requestedVersion,
+  { probe = probeVersionFile } = {}
+) {
+  const trimmed = String(explicitPath || '').trim()
+  if (!trimmed) {
+    return { ok: false, code: 'EXPLICIT_EMPTY', message: 'YT_DLP_PATH is empty.' }
+  }
+  if (!isAbsolute(trimmed)) {
+    return {
+      ok: false,
+      code: 'EXPLICIT_NOT_ABSOLUTE',
+      message:
+        `YT_DLP_PATH must be an absolute executable path (got "${trimmed}"). ` +
+        'Point it at a yt-dlp binary and never at a bare command name.'
     }
-    console.error(`[runtime] YT_DLP_PATH is set to "${explicit}" but does not run — fix the path.`)
-    process.exit(1)
   }
-
-  const localBin = join(projectRoot, '.runtime', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
-  const localVersion = existsSync(localBin) ? versionOf(localBin) : null
-  if (localVersion) {
-    log(`[runtime] Local runtime OK (.runtime/bin/yt-dlp ${localVersion}).`)
-    process.exit(0)
+  if (!existsSync(trimmed)) {
+    return {
+      ok: false,
+      code: 'EXPLICIT_MISSING',
+      message: `YT_DLP_PATH "${trimmed}" does not exist.`
+    }
   }
-
-  // Nothing local: try a system yt-dlp before downloading.
-  const systemVersion = versionOf('yt-dlp')
-  if (systemVersion) {
-    log(`[runtime] Using system yt-dlp ${systemVersion}.`)
-    process.exit(0)
+  const detected = probe(trimmed)
+  if (!detected) {
+    return {
+      ok: false,
+      code: 'EXPLICIT_NOT_RUNNING',
+      message: `YT_DLP_PATH "${trimmed}" does not run \`yt-dlp --version\` (check the file/permissions).`
+    }
   }
-
-  log('[runtime] No usable yt-dlp — bootstrapping the pinned standalone binary...')
-  const { spawnSync: run } = await import('node:child_process')
-  const result = run(process.execPath, [join(scriptDir, 'bootstrap-runtime.mjs')], {
-    stdio: 'inherit',
-    encoding: 'utf8'
-  })
-  if (result.status !== 0) {
-    console.error('[runtime] Bootstrap failed — the server will not be ready (readiness reports RUNTIME_MISSING).')
-    process.exit(1)
+  if (detected !== requestedVersion) {
+    return {
+      ok: false,
+      code: 'EXPLICIT_VERSION_MISMATCH',
+      message:
+        `YT_DLP_PATH reports yt-dlp ${detected}, but the effective requested version is ${requestedVersion}. ` +
+        `Either point YT_DLP_PATH at a ${requestedVersion} binary or set YT_DLP_VERSION=${detected} to pin that version explicitly.`
+    }
   }
-  const after = versionOf(localBin)
-  if (!after) {
-    console.error('[runtime] Bootstrap completed but the binary still does not run.')
-    process.exit(1)
-  }
-  log(`[runtime] Runtime ready (yt-dlp ${after}).`)
-  process.exit(0)
+  return { ok: true, code: 'EXPLICIT_OK', detected }
 }
 
-main()
+/**
+ * Ensure the executable actually pinned for this run is in place. Returns
+ * { ok, reason, version, operatorManaged } or { ok:false, code, message }.
+ */
+export async function ensureRuntime({
+  rootDir = projectRoot,
+  requested = null,
+  explicitPath = null,
+  fetchImpl = globalThis.fetch,
+  log = () => {}
+} = {}) {
+  let requestedVersion
+  try {
+    requestedVersion = requested || effectiveRequestedVersion()
+  } catch (error) {
+    return { ok: false, code: 'INVALID_VERSION', message: error.message }
+  }
+
+  const explicit = explicitPath !== null ? explicitPath : (process.env.YT_DLP_PATH || '').trim()
+  if (explicit) {
+    const verification = verifyExplicitPath(explicit, requestedVersion)
+    if (!verification.ok) return verification
+    log(`Operator-managed yt-dlp ${verification.detected} at ${explicit} (exact match).`)
+    return {
+      ok: true,
+      code: 'EXPLICIT_OK',
+      version: requestedVersion,
+      operatorManaged: true,
+      detected: verification.detected
+    }
+  }
+
+  try {
+    const installed = await installPinnedRuntime({ rootDir, requested: requestedVersion, fetchImpl, log })
+    return { ok: true, ...installed, operatorManaged: false }
+  } catch (error) {
+    return { ok: false, code: 'MANAGED_INSTALL_FAILED', message: error.message }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLI (only when executed directly)
+// ---------------------------------------------------------------------------
+
+function isMainModule() {
+  const invoked = process.argv[1]
+  if (!invoked) return false
+  return resolve(invoked) === fileURLToPath(import.meta.url)
+}
+
+if (isMainModule()) {
+  const quiet = process.argv.includes('--quiet')
+  const log = quiet
+    ? () => {}
+    : (msg) => console.log(msg)
+  const rootDir = projectRoot
+
+  ensureRuntime({ rootDir, log }).then((result) => {
+    if (result.ok) {
+      if (!quiet) {
+        const mode = result.operatorManaged
+          ? 'YT_DLP_PATH (operator-managed)'
+          : '.runtime/bin/yt-dlp (managed)'
+        console.log(`[runtime] Runtime ready — yt-dlp ${result.version} (${mode}).`)
+      }
+      process.exit(0)
+      return
+    }
+    console.error(`[runtime] ${result.message}`)
+    process.exit(1)
+  })
+}

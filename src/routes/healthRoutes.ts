@@ -5,18 +5,24 @@
  *   GET /api/health        — compatible alias of the above
  *   GET /api/health/ready  — local runtime prerequisites, cached 45 s
  *
- * Readiness verifies CONFIGURATION + NODE + yt-dlp executable + version +
- * supported JS runtime. It deliberately performs NO YouTube extraction:
- * "the runtime is present" must never be confused with "YouTube is not
- * blocking this IP right now" — that distinction lives in the protected
- * diagnostics (see src/services/diagnostics.ts).
+ * Readiness verifies CONFIGURATION + NODE + session storage + yt-dlp
+ * executable + EXACT pinned-version match + supported JS runtime. It
+ * deliberately performs NO YouTube extraction: "the runtime is present"
+ * must never be confused with "YouTube is not blocking this IP right now" —
+ * that distinction lives in the protected diagnostics
+ * (see src/services/diagnostics.ts). Once shutdown begins, readiness
+ * immediately answers 503 SHUTTING_DOWN before consulting any cached
+ * result.
  */
 
 import { Hono } from 'hono'
 import { assertNodeVersion, assertValidConfig, ConfigError, config, NODE_VERSION_MIN } from '../config.js'
 import { checkRuntimeHealth } from '../services/ytdlp/runYtDlp.js'
-import { compareYtDlpVersions, describeRuntimeState } from '../services/ytdlp/runtime.js'
+import { describeRuntimeState } from '../services/ytdlp/runtime.js'
 import { MIN_EJS_RUNTIME_VERSION } from '../services/ytdlp/runtime.js'
+import { authIsDisabled } from '../middleware/session.js'
+import { sessionStore } from '../services/sessionStore.js'
+import { isShuttingDown } from '../services/shutdownState.js'
 
 const healthRoutes = new Hono()
 
@@ -71,14 +77,15 @@ const READY_CACHE_TTL_MS = 45_000
 let readinessCache: ReadinessState | null = null
 
 async function computeReadiness(): Promise<ReadinessState> {
-  // 1. Configuration valid (secrets present in production etc.).
+  // 1. Configuration valid (secrets present, env recognized, auth setting
+  // strict — production fails closed without credentials).
   try {
     assertValidConfig()
   } catch (error) {
     return {
       status: 'not_ready',
       checkedAt: Date.now(),
-      reason: error instanceof ConfigError ? 'CONFIG_INVALID' : 'CONFIG_INVALID'
+      reason: 'CONFIG_INVALID'
     }
   }
 
@@ -89,7 +96,17 @@ async function computeReadiness(): Promise<ReadinessState> {
     return {
       status: 'not_ready',
       checkedAt: Date.now(),
-      reason: error instanceof ConfigError ? 'NODE_TOO_OLD' : 'NODE_TOO_OLD'
+      reason: 'NODE_TOO_OLD'
+    }
+  }
+
+  // 2.5. Session storage healthy when sessions are enforced (a failed
+  // write fails readiness closed until recovery/restart).
+  if (!authIsDisabled() && !sessionStore.isHealthy()) {
+    return {
+      status: 'not_ready',
+      checkedAt: Date.now(),
+      reason: 'AUTH_STORAGE_UNAVAILABLE'
     }
   }
 
@@ -112,10 +129,24 @@ async function computeReadiness(): Promise<ReadinessState> {
     }
   }
 
-  // Warn but do not fail when the installed version differs from the pinned
-  // one — the pinned version is a floor for EJS support.
-  const pinned = config.ytDlpVersion
-  const belowPin = compareYtDlpVersions(runtime.version || '', pinned) < 0
+  // 6. EXACT requested-version match — the pinned/requested release is the
+  // contract (managed binary AND explicit YT_DLP_PATH). A mismatch is NOT
+  // ready; it is never a warning attached to success.
+  const requested = config.ytDlpVersion.trim()
+  const detected = (runtime.version || '').trim()
+  if (detected !== requested) {
+    return {
+      status: 'not_ready',
+      checkedAt: Date.now(),
+      reason: 'YTDLP_VERSION_MISMATCH',
+      detail: {
+        nodeVersion: process.version,
+        ytDlpMode: state.mode,
+        ytDlpDetectedVersion: runtime.version,
+        jsRuntime: runtime.jsRuntime
+      }
+    }
+  }
 
   return {
     status: 'ready',
@@ -125,13 +156,16 @@ async function computeReadiness(): Promise<ReadinessState> {
       ytDlpMode: state.mode,
       ytDlpDetectedVersion: runtime.version,
       jsRuntime: runtime.jsRuntime
-    },
-    ...(belowPin ? { reason: 'BELOW_PINNED_VERSION' } : {})
+    }
   }
 }
 
 // GET /api/health/ready — cached local prerequisite check (no extraction).
 healthRoutes.get('/health/ready', async (c) => {
+  // Shutdown short-circuits EVERYTHING, including the cached success.
+  if (isShuttingDown()) {
+    return c.json({ status: 'not_ready', reason: 'SHUTTING_DOWN' }, 503)
+  }
   const now = Date.now()
   if (!readinessCache || now - readinessCache.checkedAt > READY_CACHE_TTL_MS) {
     readinessCache = await computeReadiness()

@@ -1,16 +1,26 @@
 // Session auth acceptance tests. Env secrets are set BEFORE the config
 // module is imported (config reads env at import time; each test file runs
-// in its own module registry).
+// in its own module registry). SESSION_STORE_PATH points at a temp file so
+// the persistent allowlist never touches repository state.
 process.env.NODE_ENV = 'production'
 process.env.ACCESS_KEY = 'household-test-key-123'
-process.env.SESSION_SECRET = 'session-test-secret-456'
+process.env.SESSION_SECRET = 'session-test-secret-456789-0123456789-abcdef'
+process.env.HOST = '0.0.0.0'
+process.env.SESSION_STORE_PATH = joinTmpSessionPath()
 
-import { describe, expect, it, beforeAll } from 'vitest'
+import { join, dirname } from 'node:path'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { describe, expect, it, beforeAll, afterAll } from 'vitest'
 import { Hono } from 'hono'
 
+function joinTmpSessionPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'ft-session-auth-'))
+  return join(dir, 'sessions.json')
+}
+
 let app: Hono
-let sessionRoutes: import('hono').Hono
-let issueSessionToken: (now?: number) => string
+let issueSessionToken: (now?: number) => Promise<string>
 
 const ACCESS_KEY = 'household-test-key-123'
 
@@ -22,16 +32,23 @@ function extractCookie(setCookie: string | null, name: string): string | null {
 }
 
 beforeAll(async () => {
+  const sessionStore = (await import('../src/services/sessionStore.js')).sessionStore
+  await sessionStore.initialize()
+
   const sessionMod = await import('../src/routes/sessionRoutes.js')
-  sessionRoutes = sessionMod.sessionRoutes
   const middleware = await import('../src/middleware/session.js')
   issueSessionToken = middleware.issueSessionToken
+  sessionRoutes = sessionMod.sessionRoutes
 
   app = new Hono()
   app.route('/api', sessionRoutes)
-  // A stand-in for a private resource (metadata/search/streams all mount
-  // through requireSession in src/index.ts).
   app.get('/api/private', middleware.requireSession(), (c) => c.json({ ok: true }))
+})
+
+let sessionRoutes: import('hono').Hono
+
+afterAll(() => {
+  rmSync(dirname(process.env.SESSION_STORE_PATH as string), { recursive: true, force: true })
 })
 
 describe('session authentication', () => {
@@ -109,7 +126,7 @@ describe('session authentication', () => {
   })
 
   it('an expired token → 401', async () => {
-    const expired = issueSessionToken(Date.now() - 31 * 24 * 60 * 60 * 1000)
+    const expired = await issueSessionToken(Date.now() - 31 * 24 * 60 * 60 * 1000)
     const res = await app.request('/api/private', { headers: { cookie: `ft_session=${expired}` } })
     expect(res.status).toBe(401)
   })
@@ -148,7 +165,7 @@ describe('session authentication', () => {
     const authedBody = JSON.stringify(await authed.json())
     expect(authedBody).toContain('"authenticated":true')
     expect(authedBody).not.toContain(ACCESS_KEY)
-    expect(authedBody).not.toContain('session-test-secret-456')
+    expect(authedBody).not.toContain('session-test-secret-456789-0123456789-abcdef')
 
     const anon = await app.request('/api/session')
     const anonBody = JSON.stringify(await anon.json())

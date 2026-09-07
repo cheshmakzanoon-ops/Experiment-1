@@ -1,26 +1,41 @@
 /**
  * FreeBuff Cloud entrypoint.
  *
- *   - validates Node ≥ 22 and fails CLOSED on production without
- *     ACCESS_KEY / SESSION_SECRET (never an insecure silent "allow all"),
+ *   - validates Node ≥ 22 and fails CLOSED on every environment without
+ *     ACCESS_KEY / SESSION_SECRET (never an insecure silent "allow all";
+ *     AUTH_DISABLED=true works only on an explicit loopback dev binding),
+ *   - initializes the persistent session store BEFORE accepting requests
+ *     (corruption fails startup; a later write failure fails readiness),
+ *   - verifies the pinned yt-dlp executable (same ensure script as a
+ *     bounded child — also for direct `node dist/index.js` startup) before
+ *     any production probing/extraction,
  *   - serves same-origin UI + API with NO wildcard CORS,
  *   - protects every /api/* route (except cheap liveness) with an HttpOnly
  *     same-origin session cookie,
  *   - adds security headers and a practical self-only CSP,
  *   - routes all expensive YouTube work through the bounded yt-dlp runner,
- *   - handles SIGTERM/SIGINT with bounded graceful shutdown.
+ *   - handles SIGTERM/SIGINT with ONE ordered, awaitable graceful shutdown:
+ *     close admission → fence new spawns → drain HTTP in parallel with
+ *     real child exits → clean exit (or a bounded nonzero force-exit).
  */
 
 import { serve, type ServerType } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
+import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { Hono, type Context } from 'hono'
 import { assertNodeVersion, assertValidConfig, ConfigError, config } from './config.js'
-import { configureGateFromConfig } from './services/ytdlp/queue.js'
-import { terminateAllChildren } from './services/ytdlp/runYtDlp.js'
-import { authIsDisabled } from './middleware/session.js'
+import { ytDlpGate } from './services/ytdlp/queue.js'
+import {
+  setSpawnFence,
+  terminateAllChildren,
+  probeDetectedVersion
+} from './services/ytdlp/runYtDlp.js'
+import { authIsDisabled, currentSession } from './middleware/session.js'
+import { sessionStore } from './services/sessionStore.js'
+import { markShuttingDown } from './services/shutdownState.js'
 import { clientIp, RateLimiter } from './middleware/rateLimit.js'
 import { streamByteCounter } from './middleware/streamByteCounter.js'
 import { bandwidthMonitor, keepalive } from './config/freebuff.js'
@@ -31,10 +46,9 @@ import { feedRoutes } from './routes/feedRoutes.js'
 import { healthRoutes } from './routes/healthRoutes.js'
 import { diagnosticRoutes } from './routes/diagnosticRoutes.js'
 import { sessionRoutes } from './routes/sessionRoutes.js'
-import { currentSession } from './middleware/session.js'
 
 // ---------------------------------------------------------------------------
-// Startup validation (fail closed, precisely)
+// Startup validation (fail closed, precisely) — before ANY socket binding
 // ---------------------------------------------------------------------------
 
 try {
@@ -52,8 +66,77 @@ try {
   process.exit(1)
 }
 
-// Apply the configured yt-dlp concurrency bounds to the shared gate.
-configureGateFromConfig(config.ytDlpConcurrency, config.ytDlpQueueMax, config.ytDlpQueueTimeoutMs)
+// Apply the configured yt-dlp concurrency bounds to the shared gate ONCE,
+// before any request can reach it (refuses changes while work is active).
+try {
+  ytDlpGate.configure({
+    activeLimit: config.ytDlpConcurrency,
+    queueMax: config.ytDlpQueueMax,
+    queueTimeoutMs: config.ytDlpQueueTimeoutMs
+  })
+} catch (error) {
+  console.error('[config] Could not configure the yt-dlp gate:')
+  console.error(error instanceof Error ? error.message : error)
+  process.exit(1)
+}
+
+// Persistent active-session allowlist — initialize before accepting
+// requests. A corrupt store fails startup; never silently replaced.
+async function initializeSessionStore(): Promise<void> {
+  if (authIsDisabled()) return // loopback dev mode: no session enforcement
+  try {
+    await sessionStore.initialize()
+    console.log('[auth] Session store ready.')
+  } catch (error) {
+    console.error('[auth] Session store initialization failed:')
+    console.error(error instanceof Error ? error.message : error)
+    process.exit(1)
+  }
+}
+
+/**
+ * Direct startup (and `npm start`) verifies the pinned executable through
+ * the SAME ensure script, as a bounded child, BEFORE any probing or
+ * production extraction. `prestart` already ran it under npm; the child is
+ * idempotent (receipt re-hash + version check, no re-download).
+ */
+function ensureRuntimeAtBoot(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const script = fileURLToPath(new URL('../scripts/ensure-runtime.mjs', import.meta.url))
+    const child = execFile(
+      process.execPath,
+      [script, '--quiet'],
+      { timeout: 240_000, maxBuffer: 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = (stderr || stdout || '').toString().trim().slice(0, 800)
+          reject(
+            new Error(
+              `Runtime verification failed (${(error as NodeJS.ErrnoException).code || error.message})${detail ? `: ${detail}` : ''}`
+            )
+          )
+          return
+        }
+        resolve()
+      }
+    )
+    // Never let the ensure child hold the process open past its timeout.
+    child.unref?.()
+  })
+}
+
+await initializeSessionStore()
+console.log('[runtime] Verifying the pinned yt-dlp executable...')
+try {
+  await ensureRuntimeAtBoot()
+  console.log('[runtime] yt-dlp verification passed.')
+} catch (error) {
+  console.error('[runtime] ' + (error instanceof Error ? error.message : String(error)))
+  process.exit(1)
+}
+// Warm the detected version once so extraction args (e.g. --js-runtimes)
+// are built from the DETECTED executable, and readiness is honest.
+await probeDetectedVersion(true).catch(() => null)
 
 const app = new Hono()
 
@@ -84,8 +167,6 @@ function logRequest(c: Context, startedAt: number): void {
   const isApi = c.req.path.startsWith('/api/')
   if (!isApi && c.req.path !== '/') return // assets are too noisy
   if (isStream) {
-    // Streaming requests are measured in bytes/duration separately; a long
-    // relay is not an API latency bug.
     const duration = Date.now() - startedAt
     if (c.res.status >= 400) {
       console.warn(
@@ -224,28 +305,17 @@ app.use('/api/*', async (c, next) => {
 // Rate limiting by class (session/ip keyed; Retry-After returned)
 // ---------------------------------------------------------------------------
 
-// Moderate limit: ordinary metadata/feed/thumbnail/stats traffic.
 app.use('/api/feed/stats', apiLimiter.middleware())
 app.use('/api/stream/stats', apiLimiter.middleware())
 
-// Video metadata triggers extraction; thumbnails never do. Both share the
-// /api/video/* tree, so branch on the suffix instead of double-mounting.
 app.use('/api/video/*', async (c, next) => {
   const limiter = c.req.path.endsWith('/thumbnail') ? apiLimiter : extractLimiter
   return limiter.middleware()(c, next)
 })
 
-// Low limit: calls that can trigger yt-dlp extraction work.
 app.use('/api/search', extractLimiter.middleware())
 app.use('/api/feed/home', extractLimiter.middleware())
 app.use('/api/feed/category/*', extractLimiter.middleware())
-
-// /api/diag/* is additionally gated inside diagnosticRoutes.ts (disabled by
-// default; its own strict limiter when enabled).
-
-// /api/stream/* is NOT request-count limited: stream requests are repeated
-// byte-range reads whose cost is bounded by the yt-dlp gate/cache, not by
-// request count (see section 6 of the hardening brief).
 
 // ---------------------------------------------------------------------------
 // Protected API routes
@@ -306,8 +376,7 @@ const port = config.port
 keepalive.start()
 
 if (authIsDisabled()) {
-  console.warn('[auth] Session enforcement DISABLED (development mode).')
-  console.warn('[auth]   Set ACCESS_KEY + SESSION_SECRET (and NODE_ENV=production) to protect the proxy.')
+  console.warn('[auth] Session enforcement DISABLED (explicit loopback-only development mode).')
 }
 
 console.log(`Server starting on http://${hostname}:${port}`)
@@ -319,34 +388,67 @@ const server: ServerType = serve({
 })
 
 // ---------------------------------------------------------------------------
-// Bounded graceful shutdown
+// Ordered, awaitable graceful shutdown
 // ---------------------------------------------------------------------------
 
 const SHUTDOWN_GRACE_MS = 10_000
 let shuttingDown = false
+let forceTimer: ReturnType<typeof setTimeout> | null = null
+
+async function shutdownSequence(): Promise<void> {
+  // Terminate active children AND await their REAL exits (close), in
+  // parallel with bounded HTTP draining. Do not exit merely because
+  // server.close fired while children remain alive.
+  const childrenDone = terminateAllChildren(8000)
+  const httpDrained = new Promise<void>((resolve) => {
+    server.close(() => resolve())
+  })
+  await Promise.allSettled([childrenDone, httpDrained])
+}
 
 function shutdown(signal: string): void {
-  if (shuttingDown) return
+  if (shuttingDown) return // repeated signals never duplicate timers/loops
   shuttingDown = true
+  markShuttingDown()
   console.log(`[shutdown] ${signal} received — draining`)
 
   keepalive.stop()
 
-  // Stop accepting new expensive work and terminate yt-dlp children.
-  terminateAllChildren()
+  // 1. Close yt-dlp admission (queued jobs rejected NOW, their timers
+  // cleared) and raise the runner-level no-new-spawns fence (also blocks
+  // bypassQueue version probes).
+  ytDlpGate.abortQueued('Server is shutting down')
+  setSpawnFence(true)
 
-  // Let active responses finish within a bounded grace period.
-  const forceTimer = setTimeout(() => {
-    console.error('[shutdown] Grace period elapsed — forcing exit')
+  const cleanup = shutdownSequence()
+
+  // Bounded overall grace: at the deadline force remaining children and
+  // sockets closed and exit NON-ZERO (never report a clean exit).
+  forceTimer = setTimeout(() => {
+    console.error('[shutdown] Grace period elapsed — forcing remaining sockets/children closed')
+    try {
+      const http = (server as unknown as { closeAllConnections?: () => void })
+      http.closeAllConnections?.()
+    } catch {
+      /* best effort */
+    }
+    void terminateAllChildren(1000)
     process.exit(1)
   }, SHUTDOWN_GRACE_MS)
   forceTimer.unref()
 
-  server.close(() => {
-    clearTimeout(forceTimer)
-    console.log('[shutdown] Clean exit')
-    process.exit(0)
-  })
+  void cleanup.then(
+    () => {
+      if (forceTimer) clearTimeout(forceTimer)
+      forceTimer = null
+      console.log('[shutdown] Clean exit')
+      process.exit(0)
+    },
+    (error) => {
+      console.error('[shutdown] Drain failed:', error)
+      process.exit(1)
+    }
+  )
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'))

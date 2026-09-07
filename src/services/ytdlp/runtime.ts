@@ -1,21 +1,25 @@
 /**
  * yt-dlp runtime resolution + version utilities.
  *
- * Executable resolution order (documented in README):
- *   1. `YT_DLP_PATH`   — explicit operator override (trusted),
- *   2. `.runtime/bin/yt-dlp` — repository-local binary installed by
- *      `npm run bootstrap:runtime` (gitignored; used on Freebuff Cloud),
- *   3. `yt-dlp` on PATH (system install).
+ * Executable resolution (documented in README):
+ *   1. `YT_DLP_PATH`   — explicit operator override (operator-managed;
+ *      never overwritten, must match the effective requested version),
+ *   2. `.runtime/bin/yt-dlp` — repository-local binary installed/verified
+ *      by scripts/ensure-runtime.mjs (gitignored; used on Freebuff Cloud).
+ *
+ * There is NO unverified system-PATH fallback: the app only ever spawns an
+ * explicitly verified path (scripts/ensure-runtime.mjs runs before any
+ * production extraction, including direct `node dist/index.js` startup).
  *
  * The version is pinned in ONE place (config.ytDlpVersion, env
- * `YT_DLP_VERSION`; default 2026.08.19). Bootstrap downloads the official
- * standalone release binary and verifies SHA-256 against the release's
- * SHA2-256SUMS before trusting it (scripts/bootstrap-runtime.mjs).
+ * `YT_DLP_VERSION`; default 2026.08.19). ensure-runtime.mjs requires the
+ * exact requested version for both modes and records a SHA-256 receipt
+ * after verifying against the official release checksum manifest.
  *
  * EJS (external JavaScript challenge) support: modern yt-dlp runs YouTube's
  * JS challenges through a pluggable JS runtime. Node 22 is the supported
  * runtime here, passed as `--js-runtimes node` from the single runner —
- * never scattered across call sites.
+ * derived from the DETECTED executable version, never the requested one.
  */
 
 import { existsSync, statSync } from 'node:fs'
@@ -31,7 +35,7 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
 /** Absolute path of the repository-local runtime directory. */
 export function runtimeRootDir(): string {
-  return resolve(__dirname, '../../../.runtime')
+  return resolve(__dirname, '../../..', '.runtime')
 }
 
 export function runtimeBinaryPath(): string {
@@ -48,12 +52,13 @@ function isExecutableFile(path: string): boolean {
   }
 }
 
-/** The resolved yt-dlp command path, or `yt-dlp` to fall back to PATH. */
+/**
+ * The resolved yt-dlp command path. Explicit YT_DLP_PATH wins; otherwise the
+ * managed repository-local binary. NEVER an unverified PATH fallback.
+ */
 export function resolveYtDlpCommand(): string {
   if (config.ytDlpPath) return config.ytDlpPath
-  const local = runtimeBinaryPath()
-  if (isExecutableFile(local)) return local
-  return 'yt-dlp'
+  return runtimeBinaryPath()
 }
 
 /** True when a local (bootstrap) binary is present. */
@@ -66,7 +71,7 @@ export function hasConfiguredRuntime(): boolean {
   return !!config.ytDlpPath && isExecutableFile(config.ytDlpPath)
 }
 
-/** True when the local/configured runtime is usable (PATH fallback unknown). */
+/** True when either explicit or managed binaries are present. */
 export function hasUsableRuntime(): boolean {
   return hasConfiguredRuntime() || hasLocalRuntimeBinary()
 }
@@ -95,7 +100,7 @@ export function supportsJsRuntimesOption(version: string | null): boolean {
   return compareYtDlpVersions(version, MIN_EJS_RUNTIME_VERSION) >= 0
 }
 
-/** Asset name for the official standalone Linux binary of the running arch. */
+/** Asset name for the official standalone binary of the running arch. */
 export function releaseAssetName(arch = process.arch): string | null {
   if (process.platform === 'win32') return 'yt-dlp.exe'
   if (process.platform !== 'linux') return null
@@ -106,10 +111,10 @@ export function releaseAssetName(arch = process.arch): string | null {
 
 /** Human description used by readiness (never full filesystem paths). */
 export function describeRuntimeState(): {
-  mode: 'env' | 'local' | 'path' | 'missing'
+  mode: 'env' | 'local' | 'missing'
   version: string
 } {
   if (config.ytDlpPath) return { mode: 'env', version: config.ytDlpVersion }
   if (hasLocalRuntimeBinary()) return { mode: 'local', version: config.ytDlpVersion }
-  return { mode: 'path', version: config.ytDlpVersion }
+  return { mode: 'missing', version: config.ytDlpVersion }
 }

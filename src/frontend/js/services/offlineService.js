@@ -2,28 +2,44 @@
 //
 // Downloads the low-bandwidth stream of a video through the proxy
 // (/api/stream/:id?quality=240) in small sequential byte-range chunks and
-// persists each chunk in IndexedDB as it lands. A flaky 1–2 Mbps network
-// can drop mid-download without losing anything:
+// persists each chunk + its updated metadata in IndexedDB as one atomic
+// transaction. A flaky 1–2 Mbps network can drop mid-download without
+// losing anything:
 //
 //   • each chunk is an exact Range request that must return a matching 206
-//     with a validated Content-Range,
-//   • completed chunks + progress are persisted per chunk, so a later
-//     start/resume continues from the last completed byte,
-//   • transient chunk failures retry with bounded exponential backoff; a
-//     network loss marks the download paused (NOT deleted),
-//   • only explicit cancel/remove deletes partial data,
-//   • if the underlying object changes between chunks (ETag/length
-//     mismatch) the download restarts cleanly instead of joining bytes
-//     from two different files,
-//   • memory stays bounded: at most one ~2 MiB chunk is held at a time —
-//     never a growing array of Uint8Arrays for the whole video.
+//     with a VALIDATED Content-Range ({start,end,total}, all safe integers,
+//     positive total > end); unknown totals are unsupported and pause with
+//     RANGE_TOTAL_UNKNOWN,
+//   • a 200 response to a ranged download request is UNSUPPORTED — its
+//     body is cancelled immediately (never blob()/arrayBuffer()/text()) and
+//     the download pauses with RANGE_UNSUPPORTED (ordinary ONLINE playback
+//     still relays truthful HTTP 200 responses unchanged),
+//   • completed chunks + metadata are persisted together per chunk, so a
+//     later start/resume continues from the last COMMITTED byte, derived
+//     from validated stored chunk coverage (never optimistic counters),
+//   • transient chunk failures retry at most three times with abortable
+//     bounded backoff (network/timeouts/429/502/503/504 only), honoring
+//     Retry-After (a Retry-After over 30 s pauses with a retry timestamp);
+//     one reauthentication allowance per chunk operation, a second 401 is
+//     terminal for that operation,
+//   • only explicit cancel/remove deletes partial data (awaited, real
+//     transaction across both stores),
+//   • if the underlying object changes between chunks (established ETag /
+//     total / Last-Modified without a strong ETag) the download performs
+//     ONE clean restart; a second change pauses with SOURCE_CHANGED,
+//   • memory stays bounded: at most one ~2 MiB chunk is accumulated per
+//     fetch — never the whole video (strict counted reads with cap,
+//     overflow cancels immediately, premature EOF is rejected),
+//   • per-chunk deadlines: 180 s to response headers, 30 s body idle,
+//     120 s overall body time; timers/listeners cleared on every path.
 //
-// IndexedDB schema (v2):
+// IndexedDB schema (v2 — additive only):
 //   videos  { id, …meta, status: downloading|paused|ready, totalBytes,
-//             completedBytes, mimeType, quality, etag, lastModified, … }
-//   chunks  { key: "<videoId>:<index>", blob, start, end }
+//             completedBytes, chunkCount, mimeType, quality, etag,
+//             etagStrong, lastModified, createdAt, updatedAt, … }
+//   chunks  { key: "<videoId>:<index>", start, end, blob, size }
 
-import { ensureSession, ApiError, sessionEnforced } from '../api.js';
+import { ApiError, sessionEnforced, waitForGateOrAbort } from '../api.js';
 
 const DB_NAME = 'yt-offline-db';
 const DB_VERSION = 2;
@@ -34,14 +50,33 @@ const DOWNLOAD_QUALITY = 240; // matches the player's default stream
 const CHUNK_BYTES = 2 * 1024 * 1024; // 2 MiB per bounded range request
 const MAX_CHUNK_ATTEMPTS = 3;
 const PROGRESS_EVENT_MS = 250;
+const HEADER_DEADLINE_MS = 180_000;
+const BODY_IDLE_DEADLINE_MS = 30_000;
+const BODY_OVERALL_DEADLINE_MS = 120_000;
+const MAX_SOURCE_RESTARTS = 1;
 
 let dbPromise = null;
 let persistRequested = false;
 
-/** @type {Map<string, AbortController>} active download controllers */
-const controllers = new Map();
+/** @type {Map<string, Operation>} active download operations */
+const operations = new Map();
 /** @type {Map<string, string>} created object URLs (revoked on delete) */
 const urlCache = new Map();
+/** @type {Map<string, number>} throttled progress emit timestamps */
+const lastEmit = new Map();
+
+/**
+ * One download operation per video: owns the AbortController and a settled
+ * promise so two simultaneous starts can never create two writers.
+ */
+class Operation {
+    constructor(id) {
+        this.id = id;
+        this.controller = new AbortController();
+        /** Filled by startDownload; awaiting it yields real settlement. */
+        this.done = null;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // IndexedDB plumbing
@@ -67,7 +102,9 @@ function openDb() {
             if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
                 db.createObjectStore(CHUNKS_STORE, { keyPath: 'key' });
             }
-            // v1 → v2: the old monolithic blob store is obsolete; drop it.
+            // Schema changes stay additive; only the truly obsolete v1
+            // monolithic blob store is ever dropped (never completed v2
+            // downloads).
             if (db.objectStoreNames.contains('blobs')) {
                 db.deleteObjectStore('blobs');
             }
@@ -79,60 +116,139 @@ function openDb() {
     return dbPromise;
 }
 
-/** Run a single transaction over one store. */
-function withStore(storeName, mode, fn) {
+/**
+ * Run a synchronous request-issuing function inside ONE transaction.
+ * Synchronous exceptions abort the transaction (rollback). Resolution
+ * happens only on transaction completion; no unrelated async work runs
+ * inside the transaction. When the callback returns a promise (a wrapped
+ * request), the transaction waits for completion before resolving with the
+ * request's value — a request error rejects and aborts the transaction.
+ */
+function withTransaction(storeNames, mode, fn) {
     return openDb().then(
         (db) =>
             new Promise((resolve, reject) => {
-                const transaction = db.transaction(storeName, mode);
-                const store = transaction.objectStore(storeName);
-                let result;
+                const transaction = db.transaction(storeNames, mode);
+                let pendingError = null;
+                let syncError = null;
+                let captured = undefined;
+                let capturedPromise = null;
                 try {
-                    result = fn(store);
+                    const result = fn(transaction);
+                    if (result && typeof result.then === 'function') {
+                        capturedPromise = result;
+                        result.then(
+                            (value) => {
+                                captured = value;
+                            },
+                            (error) => {
+                                pendingError = error;
+                                try {
+                                    transaction.abort();
+                                } catch {
+                                    /* already aborted */
+                                }
+                            }
+                        );
+                    } else {
+                        captured = result;
+                    }
                 } catch (error) {
-                    reject(error);
-                    return;
+                    syncError = error;
+                    try {
+                        transaction.abort();
+                    } catch {
+                        /* already aborted */
+                    }
                 }
-                transaction.oncomplete = () => resolve(result && result.result !== undefined ? result.result : result);
-                transaction.onerror = () => reject(transaction.error);
-                transaction.onabort = () => reject(transaction.error || new Error('Transaction aborted'));
+                transaction.oncomplete = () => {
+                    if (syncError) reject(syncError);
+                    else if (pendingError) reject(pendingError);
+                    else resolve(captured);
+                };
+                transaction.onerror = () => {
+                    if (syncError) reject(syncError);
+                    else if (pendingError) reject(pendingError);
+                    else reject(transaction.error || new Error('Transaction failed'));
+                };
+                transaction.onabort = () => {
+                    if (syncError) reject(syncError);
+                    else if (pendingError) reject(pendingError);
+                    else reject(transaction.error || new Error('Transaction aborted'));
+                };
+                void capturedPromise;
             })
     );
 }
 
-/** Transaction over two stores (keeps meta + chunks consistent enough). */
-function withTwoStores(fn) {
-    return openDb().then(
-        (db) =>
-            new Promise((resolve, reject) => {
-                const transaction = db.transaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite');
-                const videos = transaction.objectStore(VIDEOS_STORE);
-                const chunks = transaction.objectStore(CHUNKS_STORE);
-                let result;
-                try {
-                    result = fn({ videos, chunks });
-                } catch (error) {
-                    reject(error);
-                    return;
-                }
-                transaction.oncomplete = () => resolve(result && result.result !== undefined ? result.result : result);
-                transaction.onerror = () => reject(transaction.error);
-                transaction.onabort = () => reject(transaction.error || new Error('Transaction aborted'));
-            })
-    );
+const withVideosWrite = (fn) => withTransaction(VIDEOS_STORE, 'readwrite', (tx) => fn(tx.objectStore(VIDEOS_STORE)));
+
+function getRecord(storeName, id) {
+    return withTransaction(storeName, 'readonly', (tx) => {
+        const request = tx.objectStore(storeName).get(id);
+        return wrapRequest(request);
+    });
 }
 
-const getRecord = (storeName, id) => withStore(storeName, 'readonly', (store) => store.get(id));
-const getAllRecords = (storeName) => withStore(storeName, 'readonly', (store) => store.getAll());
-const putRecord = (storeName, value) => withStore(storeName, 'readwrite', (store) => store.put(value));
-const deleteRecord = (storeName, id) => withStore(storeName, 'readwrite', (store) => store.delete(id));
+function wrapRequest(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+function getAllRecords(storeName) {
+    return withTransaction(storeName, 'readonly', (tx) => {
+        const request = tx.objectStore(storeName).getAll();
+        return wrapRequest(request);
+    });
+}
+
+/** Chunk prefix cursor (never loads every video's blobs). */
+function cursorChunksFor(id, onRecord) {
+    return withTransaction(CHUNKS_STORE, 'readwrite', (tx) => {
+        const store = tx.objectStore(CHUNKS_STORE);
+        const range = IDBKeyRange.bound(`${id}:`, `${id}:\uffff`);
+        const request = store.openCursor(range);
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) {
+                    resolve();
+                    return;
+                }
+                onRecord(cursor.value, cursor);
+                cursor.continue();
+            };
+            request.onerror = () => reject(request.error);
+        });
+    });
+}
+
+/** Cursor-delete a video's chunk records (part of larger transactions). */
+function deleteChunkRangeInTx(chunksStore, id) {
+    const range = IDBKeyRange.bound(`${id}:`, `${id}:\uffff`);
+    const request = chunksStore.openCursor(range);
+    let deleted = 0;
+    request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        cursor.delete();
+        deleted++;
+        cursor.continue();
+    };
+    request.onerror = () => {};
+    return deleted;
+}
 
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
 function emit(name, detail) {
-    document.dispatchEvent(new CustomEvent(name, { detail }));
+    if (typeof document !== 'undefined' && typeof CustomEvent !== 'undefined') {
+        document.dispatchEvent(new CustomEvent(name, { detail }));
+    }
 }
 
 function emitChanged(id) {
@@ -143,6 +259,13 @@ function emitProgress(id, progress, completedBytes) {
     emit('offline:progress', { id, progress, completedBytes });
 }
 
+function throttleProgress(id) {
+    if (!lastEmit.has(id)) lastEmit.set(id, 0);
+    const last = lastEmit.get(id);
+    lastEmit.set(id, Date.now());
+    return last;
+}
+
 // ---------------------------------------------------------------------------
 // Public read API
 // ---------------------------------------------------------------------------
@@ -150,14 +273,14 @@ function emitProgress(id, progress, completedBytes) {
 /**
  * Metadata record for one video:
  * { id, title, author, thumbnail, duration, status: 'downloading'|'paused'|'ready',
- *   progress, totalBytes, completedBytes, mimeType, quality, createdAt,
- *   updatedAt, etag?, lastModified? } or null.
+ *   progress, totalBytes, completedBytes, chunkCount, mimeType, quality,
+ *   createdAt, updatedAt, etag?, etagStrong?, lastModified? } or null.
  */
 export async function getDownload(id) {
     if (!offlineSupported() || !id) return null;
     try {
         const record = await getRecord(VIDEOS_STORE, id);
-        return record || null;
+        return record ? withProgress(record) : null;
     } catch {
         return null;
     }
@@ -180,20 +303,499 @@ function withProgress(record) {
     const done = record.completedBytes || 0;
     return {
         ...record,
-        progress: total > 0 ? Math.min(1, done / total) : done > 0 ? 0 : 0
+        progress: total > 0 ? Math.min(1, done / total) : 0
     };
 }
 
-async function loadChunkKeys(id) {
-    const chunks = await withStore(CHUNKS_STORE, 'readonly', (store) => store.getAll());
-    return (chunks || [])
-        .filter((chunk) => chunk.key && chunk.key.startsWith(`${id}:`))
-        .sort((a, b) => (a.key > b.key ? 1 : a.key < b.key ? -1 : 0));
+// ---------------------------------------------------------------------------
+// Chunk coverage validation (resume + playback)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the persisted chunk descriptors for a video in ASCENDING start
+ * order and validate them: contiguous starts, real Blob sizes matching
+ * start/end, no gaps/overlaps. Returns { chunks, validThrough } where
+ * validThrough is the end of the last trustworthy contiguous chunk (-1
+ * when none).
+ */
+async function loadValidatedChunks(id) {
+    const found = [];
+    await cursorChunksFor(id, (chunk) => {
+        if (chunk && chunk.key && String(chunk.key).startsWith(`${id}:`)) {
+            found.push(chunk);
+        }
+    });
+    found.sort((a, b) => {
+        const aStart = Number.isSafeInteger(a.start) ? a.start : Infinity;
+        const bStart = Number.isSafeInteger(b.start) ? b.start : Infinity;
+        if (aStart !== bStart) return aStart - bStart;
+        return 0;
+    });
+
+    const validated = [];
+    let expectedStart = 0;
+    for (const chunk of found) {
+        const start = chunk.start;
+        const end = chunk.end;
+        const size = chunk.blob && typeof chunk.blob.size === 'number' ? chunk.blob.size : -1;
+        if (
+            !Number.isSafeInteger(start) ||
+            !Number.isSafeInteger(end) ||
+            end < start ||
+            size !== end - start + 1 ||
+            start !== expectedStart
+        ) {
+            // First untrustworthy chunk: everything from here on is dropped.
+            break;
+        }
+        validated.push({ start, end, blob: chunk.blob, size, key: chunk.key });
+        expectedStart = end + 1;
+    }
+    const validThrough = validated.length > 0 ? validated[validated.length - 1].end : -1;
+    return { chunks: validated, validThrough };
 }
 
 /**
- * Object URL for a finished download, assembled from the persisted chunks.
- * Chunk blobs are disk-backed; only their references are held in memory.
+ * Delete every chunk from `firstBadStart` onward for this video (only the
+ * incompatible TRAILING records — never a whole-database wipe) and repair
+ * the video metadata to the last contiguous valid prefix.
+ */
+async function repairTrailingChunks(id, meta, firstBadStart) {
+    await withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
+        const videos = tx.objectStore(VIDEOS_STORE);
+        const chunks = tx.objectStore(CHUNKS_STORE);
+        // Delete ONLY the incompatible trailing records (start >= the first
+        // bad offset) — never the contiguous prefix, never the whole DB.
+        const range = IDBKeyRange.bound(`${id}:`, `${id}:\uffff`);
+        const cursorRequest = chunks.openCursor(range);
+        cursorRequest.onsuccess = () => {
+            const cursor = cursorRequest.result;
+            if (!cursor) return;
+            const value = cursor.value;
+            if (value && Number.isSafeInteger(value.start) && value.start >= firstBadStart) {
+                cursor.delete();
+            }
+            cursor.continue();
+        };
+        cursorRequest.onerror = () => {};
+        if (meta) {
+            videos.put(meta);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Range/response validation (Section 5 contract)
+// ---------------------------------------------------------------------------
+
+/** Parse `Content-Range: bytes START-END/TOTAL` (all safe, total > end). */
+export function parseContentRangeValue(value) {
+    if (!value) return null;
+    const match = String(value).match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/);
+    if (!match) return null;
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const total = Number(match[3]);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(total)) {
+        return null;
+    }
+    if (start < 0 || end < start || total <= end || total <= 0) return null;
+    return { start, end, total };
+}
+
+/** Parse a 416 Content-Range total token ("bytes asterisk / N" form). Returns N or null when malformed. */
+export function parseUnsatisfiedTotal(value) {
+    if (!value) return null;
+    const match = String(value).match(/^bytes\s+\*\/\s*(\d+)$/);
+    if (!match) return null;
+    const total = Number(match[1]);
+    if (!Number.isSafeInteger(total) || total < 0) return null;
+    return total;
+}
+
+const isStrongEtag = (etag) => Boolean(etag) && !/^W\//i.test(String(etag));
+
+function abortError(message) {
+    const error = new Error(message || 'cancelled');
+    error.name = 'AbortError';
+    return error;
+}
+
+function isAbort(error) {
+    return Boolean(error) && (error.name === 'AbortError' || error.name === 'cancelled');
+}
+
+function abortableSleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) {
+            reject(abortError());
+            return;
+        }
+        const timer = setTimeout(() => {
+            if (signal) signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(abortError());
+        };
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+function rangeError(kind, extra) {
+    return new ApiError(kind, extra || {});
+}
+
+/** Read one bounded 206 body with strict counting + deadlines. */
+async function readRangeBody(reader, expectedLength, startedAt, signal) {
+    const chunks = [];
+    let counted = 0;
+    let idleTimer = null;
+    const bodyDeadline = startedAt + BODY_OVERALL_DEADLINE_MS;
+    const onAbort = () => reader.cancel().catch(() => {});
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    const clearTimers = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = null;
+    };
+    const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+            reader.cancel().catch(() => {});
+            idleTimeout = true;
+        }, BODY_IDLE_DEADLINE_MS);
+    };
+
+    let idleTimeout = false;
+    try {
+        for (;;) {
+            if (idleTimeout) {
+                throw rangeError('timeout');
+            }
+            if (Date.now() > bodyDeadline) {
+                await reader.cancel().catch(() => {});
+                throw rangeError('timeout');
+            }
+            armIdle();
+            const { done, value } = await reader.read();
+            clearTimers();
+            if (signal.aborted) throw abortError();
+            if (done) break;
+            if (value && value.byteLength > 0) {
+                counted += value.byteLength;
+                if (counted > expectedLength) {
+                    // Overflow: cancel immediately; never accumulate more.
+                    await reader.cancel().catch(() => {});
+                    throw rangeError('rangeInvalid');
+                }
+                chunks.push(value);
+            }
+            if (counted === expectedLength) {
+                // Stop reading — a well-behaved 206 has no more bytes.
+                const rest = await reader.read().catch(() => ({ done: true }));
+                if (!rest.done) {
+                    await reader.cancel().catch(() => {});
+                    throw rangeError('rangeInvalid');
+                }
+                break;
+            }
+        }
+    } finally {
+        clearTimers();
+        signal.removeEventListener('abort', onAbort);
+        try {
+            reader.releaseLock();
+        } catch {
+            /* ignore */
+        }
+    }
+    if (idleTimeout) throw rangeError('timeout');
+    if (counted < expectedLength) {
+        // Premature EOF: a 206 that promised more bytes than it sent.
+        throw rangeError('rangeInvalid');
+    }
+    return new Blob(chunks);
+}
+
+/**
+ * Fetch ONE exact byte range. Requires a 206 whose validated range is
+ * consistent with the request. Returns
+ *   { kind:'chunk', range:{start,end,total}, blob, etag, lastModified, mimeType }
+ * or
+ *   { kind:'unsatisfied', total, etag, lastModified }
+ * (a 416 parsed from the "bytes asterisk / N" Content-Range form). A 200 to
+ * a ranged request is unsupported: body cancelled immediately,
+ * RANGE_UNSUPPORTED thrown. Never returns a consumed Response as an extra
+ * source of truth.
+ */
+async function fetchSingleRange(streamUrl, start, end, signal) {
+    const headers = { Range: `bytes=${start}-${end}`, 'Accept-Encoding': 'identity' };
+    const controller = new AbortController();
+    const headerTimer = setTimeout(() => controller.abort(), HEADER_DEADLINE_MS);
+    const onAbort = () => controller.abort();
+    if (signal) {
+        if (signal.aborted) throw abortError();
+        signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    let response = null;
+    let timedOut = false;
+    try {
+        response = await fetch(streamUrl, {
+            headers,
+            credentials: 'same-origin',
+            cache: 'no-store',
+            signal: controller.signal
+        });
+    } catch (error) {
+        timedOut = error && error.name === 'AbortError' && !signal?.aborted;
+        if (signal?.aborted) throw abortError();
+        throw timedOut ? rangeError('timeout') : new ApiError('offline', { cause: error });
+    } finally {
+        clearTimeout(headerTimer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+    }
+
+    if (signal && signal.aborted) {
+        await response.body?.cancel?.().catch(() => {});
+        throw abortError();
+    }
+
+    const status = response.status;
+    const etag = response.headers.get('ETag');
+    const lastModified = response.headers.get('Last-Modified');
+    const mimeType = response.headers.get('Content-Type') || 'video/mp4';
+
+    if (status === 401 && sessionEnforced()) {
+        await response.body?.cancel?.().catch(() => {});
+        throw new ApiError('unauthorized', { status: 401 });
+    }
+    if (status === 416) {
+        const total = parseUnsatisfiedTotal(response.headers.get('Content-Range'));
+        await response.body?.cancel?.().catch(() => {});
+        if (total === null) {
+            throw rangeError('rangeInvalid', { status: 416 });
+        }
+        return { kind: 'unsatisfied', total, etag, lastModified };
+    }
+    if (status === 200) {
+        // Every 200 response is unsupported for offline Range requests:
+        // cancel the full body immediately, never buffer it.
+        await response.body?.cancel?.().catch(() => {});
+        throw rangeError('rangeUnsupported', { status: 200 });
+    }
+    if (status === 404) {
+        await response.body?.cancel?.().catch(() => {});
+        throw new ApiError('notFound', { status: 404 });
+    }
+    if (status === 429) {
+        const retryAfterSeconds = Number(response.headers.get('Retry-After')) || 0;
+        await response.body?.cancel?.().catch(() => {});
+        throw new ApiError('rateLimited', { status: 429, retryAfterSeconds });
+    }
+    if (status === 502 || status === 503 || status === 504) {
+        const retryAfterSeconds = Number(response.headers.get('Retry-After')) || 0;
+        await response.body?.cancel?.().catch(() => {});
+        throw new ApiError('serverUnavailable', { status, retryAfterSeconds });
+    }
+    if (status !== 206) {
+        await response.body?.cancel?.().catch(() => {});
+        throw rangeError(status >= 400 && status < 500 ? 'permanent' : 'serverUnavailable', { status });
+    }
+
+    const contentRangeValue = response.headers.get('Content-Range');
+    const parsed = parseContentRangeValue(contentRangeValue);
+    if (!parsed) {
+        await response.body?.cancel?.().catch(() => {});
+        // `bytes S-E/*` says the server will not expose a total — this
+        // resumable downloader cannot work without one.
+        if (contentRangeValue && /^bytes\s+\d+-\d+\/\*$/i.test(String(contentRangeValue))) {
+            throw rangeError('rangeTotalUnknown', { status: 206 });
+        }
+        throw rangeError('rangeInvalid', { status: 206 });
+    }
+    // The response range must start exactly where we asked, never exceed
+    // our requested end, and expose a positive total beyond its own end.
+    if (parsed.start !== start || parsed.end > end) {
+        await response.body?.cancel?.().catch(() => {});
+        throw rangeError('rangeInvalid', { status: 206 });
+    }
+
+    const contentEncoding = (response.headers.get('Content-Encoding') || '').trim().toLowerCase();
+    const expectedLength = parsed.end - parsed.start + 1;
+    const reader = response.body?.getReader?.();
+    if (!reader) {
+        throw rangeError('rangeInvalid', { status: 206 });
+    }
+
+    const startedAt = Date.now();
+    const blob = await readRangeBody(reader, expectedLength, startedAt, signal);
+
+    // Content-Length, when present and unencoded, must agree with the
+    // counted partial body. Encoded partial representations cannot be
+    // matched to byte offsets — reject them.
+    if (contentEncoding && contentEncoding !== 'identity') {
+        throw rangeError('rangeInvalid', { status: 206 });
+    }
+    const contentLength = response.headers.get('Content-Length');
+    if (contentLength !== null) {
+        const declared = Number(contentLength);
+        if (!Number.isSafeInteger(declared) || declared !== blob.size) {
+            throw rangeError('rangeInvalid', { status: 206 });
+        }
+    }
+
+    return {
+        kind: 'chunk',
+        range: { start: parsed.start, end: parsed.end, total: parsed.total },
+        blob,
+        etag,
+        lastModified,
+        mimeType
+    };
+}
+
+/** Only network failures/timeouts/429/502/503/504 are retried transiently. */
+function isTransientChunkError(error) {
+    if (error instanceof ApiError) {
+        return (
+            error.kind === 'offline' ||
+            error.kind === 'timeout' ||
+            (error.kind === 'serverUnavailable' && error.status >= 500) ||
+            (error.kind === 'rateLimited' && error.retryAfterSeconds <= 30)
+        );
+    }
+    return false;
+}
+
+/**
+ * One chunk operation with retry + a single reauthentication allowance.
+ * A second 401 is terminal; a Retry-After over 30 s surfaces as a pause
+ * (the caller records the retry timestamp) instead of retrying earlier.
+ */
+async function requestChunk(streamUrl, start, end, signal) {
+    let authRetried = false;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < MAX_CHUNK_ATTEMPTS; attempt++) {
+        if (signal.aborted) throw abortError();
+        try {
+            return await fetchSingleRange(streamUrl, start, end, signal);
+        } catch (error) {
+            if (isAbort(error)) throw error;
+            lastError = error;
+
+            if (error instanceof ApiError && error.kind === 'unauthorized') {
+                if (!authRetried && sessionEnforced()) {
+                    authRetried = true;
+                    // One reauthentication allowance, cancellable by this
+                    // operation without cancelling another caller's login.
+                    await waitForGateOrAbort(signal);
+                    attempt--; // auth retries do not consume transient budget
+                    continue;
+                }
+                throw error; // second 401 is terminal for this operation
+            }
+
+            if (!isTransientChunkError(error)) throw error;
+            if (error instanceof ApiError && error.retryAfterSeconds > 30) {
+                // Honor Retry-After by pausing with a timestamp instead of
+                // retrying earlier than the server asked.
+                throw error;
+            }
+            if (attempt >= MAX_CHUNK_ATTEMPTS - 1) throw lastError;
+            const backoff = 500 * Math.pow(2, attempt) + Math.random() * 300;
+            await abortableSleep(backoff, signal);
+        }
+    }
+    throw lastError || rangeError('serverUnavailable');
+}
+
+// ---------------------------------------------------------------------------
+// Metadata helpers
+// ---------------------------------------------------------------------------
+
+function defaultMeta(video, existing, now) {
+    const id = video.id;
+    return {
+        id,
+        title: video.title || (existing && existing.title) || '',
+        author: video.author || (existing && existing.author) || '',
+        thumbnail: video.thumbnail || (existing && existing.thumbnail) || '',
+        duration: video.duration || (existing && existing.duration) || 0,
+        quality: DOWNLOAD_QUALITY,
+        mimeType: (existing && existing.mimeType) || 'video/mp4',
+        status: 'downloading',
+        totalBytes: (existing && Number.isSafeInteger(existing.totalBytes) && existing.totalBytes > 0
+            ? existing.totalBytes
+            : 0),
+        completedBytes: 0,
+        chunkCount: 0,
+        etag: (existing && existing.etag) || null,
+        etagStrong: Boolean(existing && existing.etagStrong),
+        lastModified: (existing && existing.lastModified) || null,
+        pausedReason: null,
+        retryAfterEpoch: null,
+        createdAt: (existing && existing.createdAt) || now,
+        updatedAt: now
+    };
+}
+
+/** Persist a video metadata record (best effort path is caller-chosen). */
+function putVideoMeta(meta) {
+    return withVideosWrite((store) => {
+        const request = store.put({ ...meta });
+        return wrapRequest(request);
+    });
+}
+
+/**
+ * THE chunk transaction: writes the chunk record AND its updated video
+ * metadata together across both stores. Resolves only on transaction
+ * completion; rejects on error/abort.
+ */
+function writeChunkTransaction(id, meta, chunk) {
+    return withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
+        const videos = tx.objectStore(VIDEOS_STORE);
+        const chunks = tx.objectStore(CHUNKS_STORE);
+        videos.put({ ...meta });
+        chunks.put({
+            key: chunk.key,
+            videoId: id,
+            index: chunk.index,
+            start: chunk.start,
+            end: chunk.end,
+            size: chunk.blob.size,
+            blob: chunk.blob
+        });
+    });
+}
+
+/** Awaited deletion of a video's records across both stores. */
+function deleteVideoData(id) {
+    revokeOfflineUrl(id);
+    return withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
+        const videos = tx.objectStore(VIDEOS_STORE);
+        const chunks = tx.objectStore(CHUNKS_STORE);
+        videos.delete(id);
+        deleteChunkRangeInTx(chunks, id);
+    });
+}
+
+function chunkKey(id, index) {
+    return `${id}:${String(index).padStart(6, '0')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Object URL assembly (validated coverage only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Object URL for a finished download assembled from validated persisted
+ * chunks. Descriptors must be contiguous, sized correctly, in ascending
+ * order, and the terminal end must match total-1.
  */
 export async function offlinePlayUrl(id) {
     if (!offlineSupported() || !id) return null;
@@ -202,11 +804,13 @@ export async function offlinePlayUrl(id) {
     try {
         const record = await getRecord(VIDEOS_STORE, id);
         if (!record || record.status !== 'ready') return null;
-        const chunkEntries = await loadChunkKeys(id);
-        if (chunkEntries.length === 0) return null;
-
-        const parts = chunkEntries.map((chunk) => chunk.blob);
+        const total = record.totalBytes;
+        if (!Number.isSafeInteger(total) || total <= 0) return null;
+        const { chunks, validThrough } = await loadValidatedChunks(id);
+        if (validThrough !== total - 1 || chunks.length === 0) return null;
+        const parts = chunks.map((chunk) => chunk.blob);
         const blob = new Blob(parts, { type: record.mimeType || 'video/mp4' });
+        if (blob.size !== total) return null;
         const url = URL.createObjectURL(blob);
         urlCache.set(id, url);
         return url;
@@ -227,105 +831,11 @@ export function revokeOfflineUrl(id) {
 // Download lifecycle
 // ---------------------------------------------------------------------------
 
-function chunkKey(id, index) {
-    return `${id}:${String(index).padStart(6, '0')}`;
-}
-
-async function removeRecords(id) {
-    revokeOfflineUrl(id);
-    await withTwoStores(async ({ videos, chunks }) => {
-        videos.delete(id);
-        const all = await new Promise((resolve, reject) => {
-            const request = chunks.getAll();
-            request.onsuccess = () => resolve(request.result || []);
-            request.onerror = () => reject(request.error);
-        });
-        for (const chunk of all) {
-            if (chunk.key && chunk.key.startsWith(`${id}:`)) chunks.delete(chunk.key);
-        }
-    }).catch(() => {});
-    await Promise.allSettled([deleteRecord(VIDEOS_STORE, id)]);
-}
-
-/** Parse `Content-Range: bytes START-END/TOTAL`. Returns null when malformed. */
-function parseContentRange(value) {
-    if (!value) return null;
-    const match = String(value).match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/);
-    if (!match) return null;
-    return {
-        start: Number(match[1]),
-        end: Number(match[2]),
-        total: match[3] === '*' ? null : Number(match[3])
-    };
-}
-
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Fetch one exact byte range from the proxy. Requires a 206 with a matching
- * Content-Range. Returns { blob, contentRange, totalBytes, etag, lastModified }.
- */
-async function fetchChunk(streamUrl, start, end, expectedTotal, signal) {
-    const headers = { Range: `bytes=${start}-${end}` };
-    const response = await fetch(streamUrl, {
-        headers,
-        credentials: 'same-origin',
-        cache: 'no-store',
-        signal
-    });
-
-    if (response.status === 401 && sessionEnforced()) {
-        await response.body?.cancel?.().catch(() => {});
-        const ok = await ensureSession();
-        if (ok) return fetchChunk(streamUrl, start, end, expectedTotal, signal);
-        throw new ApiError('unauthorized', { status: 401 });
-    }
-
-    if (response.status === 416) {
-        throw new ApiError('rateLimited', { status: 416 }); // range now unsatisfiable → restart
-    }
-    if (!response.ok) {
-        throw new ApiError(response.status === 429 ? 'rateLimited' : 'serverUnavailable', { status: response.status });
-    }
-
-    const contentRange = parseContentRange(response.headers.get('Content-Range'));
-
-    // Fallback path: a 200 (whole entity) is only acceptable for the very
-    // first zero-based request; a mid-file 200 means we can't trust ranges.
-    if (response.status === 200 && start === 0) {
-        return {
-            fullBody: true,
-            totalBytes: Number(response.headers.get('Content-Length')) || null,
-            blob: await response.blob(),
-            etag: response.headers.get('ETag'),
-            lastModified: response.headers.get('Last-Modified'),
-            response
-        };
-    }
-    if (response.status !== 206 || !contentRange) {
-        await response.body?.cancel?.().catch(() => {});
-        throw new ApiError('serverUnavailable', { status: response.status });
-    }
-
-    const body = await response.blob();
-    const total = contentRange.total ?? expectedTotal ?? null;
-    return {
-        fullBody: false,
-        totalBytes: total,
-        blob: body,
-        etag: response.headers.get('ETag'),
-        lastModified: response.headers.get('Last-Modified'),
-        response
-    };
-}
-
 /**
  * Start (or resume) an offline download.
  * @param {{id:string, title?:string, author?:string, thumbnail?:string, duration?:number}} video
  * @returns {Promise<{id:string, status:string}>}
- * Resolves even when the download pauses (partial data kept); throws
+ * Resolves with status 'paused' (partial data kept) or 'ready'; throws
  * Error('cancelled') only for explicit user cancellation.
  */
 export async function startDownload(video) {
@@ -333,236 +843,400 @@ export async function startDownload(video) {
     const id = video && video.id;
     if (!id) throw new Error('No video id');
 
-    if (controllers.has(id)) return { id, status: 'downloading' };
-
-    const existing = (await getDownload(id).catch(() => null)) || null;
-    if (existing && existing.status === 'ready') return { id, status: 'ready' };
-
-    const controller = new AbortController();
-    controllers.set(id, controller);
-    const signal = controller.signal;
-
-    const now = Date.now();
-    let meta = {
-        id,
-        title: video.title || (existing && existing.title) || '',
-        author: video.author || (existing && existing.author) || '',
-        thumbnail: video.thumbnail || (existing && existing.thumbnail) || '',
-        duration: video.duration || (existing && existing.duration) || 0,
-        quality: DOWNLOAD_QUALITY,
-        mimeType: (existing && existing.mimeType) || 'video/mp4',
-        status: 'downloading',
-        totalBytes: (existing && existing.totalBytes) || 0,
-        completedBytes: (existing && existing.completedBytes) || 0,
-        etag: (existing && existing.etag) || null,
-        lastModified: (existing && existing.lastModified) || null,
-        createdAt: (existing && existing.createdAt) || now,
-        updatedAt: now
-    };
-
-    try {
-        await putRecord(VIDEOS_STORE, meta);
-        emitChanged(id);
-    } catch (error) {
-        controllers.delete(id);
-        throw error;
+    // Register the per-video operation BEFORE the first async metadata
+    // read so simultaneous starts can never create two writers.
+    let operation = operations.get(id);
+    if (operation && operation.controller.signal.aborted) {
+        // A cancelled operation is still cleaning up — wait for its real
+        // settlement before a replacement starts.
+        if (operation.done) {
+            await operation.done.catch(() => {});
+        }
+        operation = operations.get(id);
     }
+    if (operation) {
+        // Already downloading: no second writer.
+        return { id, status: 'downloading' };
+    }
+
+    const op = new Operation(id);
+    operations.set(id, op);
+    op.done = (async () => {
+        try {
+            return await runDownload(video, op);
+        } catch (error) {
+            if (isAbort(error) || op.controller.signal.aborted) {
+                throw abortError();
+            }
+            // Network loss / quota / repeated chunk failure: keep partial
+            // data and mark the download paused with accurate metadata.
+            await pauseWithError(id, op, error).catch(() => {});
+            return { id, status: 'paused' };
+        } finally {
+            // Finalizers delete the map entry only if it still belongs to
+            // this operation (never a newer controller).
+            if (operations.get(id) === op) operations.delete(id);
+            lastEmit.delete(id);
+        }
+    })();
+    return op.done;
+}
+
+async function pauseWithError(id, op, error) {
+    if (op.controller.signal.aborted) return;
+    const latest = await getDownload(id).catch(() => null);
+    const meta = latest || { id };
+    meta.status = 'paused';
+    meta.updatedAt = Date.now();
+    if (error instanceof ApiError) {
+        meta.pausedReason = error.kind;
+        // Any transient answer that told us to wait longer than the in-app
+        // backoff budget pauses with a concrete retry timestamp.
+        if (error.retryAfterSeconds > 30) {
+            meta.retryAfterEpoch = Date.now() + error.retryAfterSeconds * 1000;
+        } else {
+            meta.retryAfterEpoch = null;
+        }
+    }
+    await putVideoMeta(meta);
+    emitChanged(id);
+}
+
+async function runDownload(video, op) {
+    const id = video.id;
+    const signal = op.controller.signal;
+    const now = Date.now();
+
+    // Load existing metadata + validate stored chunks BEFORE any write.
+    const existing = await getRecord(VIDEOS_STORE, id).catch(() => null);
+    const meta = defaultMeta(video, existing, now);
+    const loaded = await loadValidatedChunks(id);
+    let validThrough = loaded.validThrough;
+
+    if (existing) {
+        const storedTotal = meta.totalBytes;
+        const storedStatus = existing.status;
+        const committedFromChunks = validThrough + 1;
+
+        // Committed progress is DERIVED from validated stored chunk
+        // coverage — never trusted from optimistic metadata counters. Repair
+        // metadata to the last contiguous valid prefix and drop only the
+        // incompatible TRAILING records (legacy inconsistent partial records
+        // are never trusted automatically).
+        if (loaded.chunks.length > 0) {
+            meta.completedBytes = committedFromChunks;
+            meta.chunkCount = loaded.chunks.length;
+        } else if ((existing.chunkCount || 0) > 0 || (existing.completedBytes || 0) > 0) {
+            meta.completedBytes = 0;
+            meta.chunkCount = 0;
+        }
+        meta.totalBytes = storedTotal;
+
+        const claimsBeyondValidated = (existing.completedBytes || 0) > committedFromChunks;
+        const recordsBeyondValidated =
+            loaded.chunks.length > 0 && (existing.chunkCount || 0) > loaded.chunks.length;
+        if (validThrough >= 0 && (claimsBeyondValidated || recordsBeyondValidated)) {
+            await repairTrailingChunks(id, null, committedFromChunks);
+        } else if (validThrough < 0 && (existing.chunkCount || 0) > 0) {
+            // Records were claimed but nothing validated — wipe the
+            // inconsistent leftovers and start clean.
+            await repairTrailingChunks(id, null, 0);
+        }
+
+        if (
+            storedStatus === 'ready' &&
+            Number.isSafeInteger(storedTotal) &&
+            storedTotal > 0 &&
+            meta.completedBytes === storedTotal &&
+            meta.chunkCount > 0 &&
+            validThrough === storedTotal - 1 &&
+            loaded.chunks.length === meta.chunkCount
+        ) {
+            return { id, status: 'ready' };
+        }
+
+        // Without any usable validator we cannot prove an interrupted
+        // previous run still matches — restart that partial once from zero.
+        if (meta.completedBytes > 0 && !meta.etag && !meta.lastModified) {
+            meta.completedBytes = 0;
+            meta.chunkCount = 0;
+            meta.totalBytes = 0;
+            await repairTrailingChunks(id, null, 0);
+            validThrough = -1;
+        }
+    }
+
+    // Authoritative mutable state (initialized from validated persisted
+    // metadata; updated immediately after each accepted response).
+    let offset = meta.completedBytes || 0;
+    let nextChunkIndex = meta.chunkCount || 0;
+    let knownTotal = meta.totalBytes > 0 ? meta.totalBytes : null;
+    let knownEtag = meta.etag || null;
+    let knownEtagStrong = Boolean(meta.etagStrong);
+    let knownLastModified = meta.lastModified || null;
+    let sourceRestarts = 0;
+
+    meta.status = 'downloading';
+    meta.pausedReason = null;
+    meta.retryAfterEpoch = null;
+    meta.updatedAt = now;
+    await putVideoMeta(meta);
+    emitChanged(id);
 
     const streamUrl = `/api/stream/${encodeURIComponent(id)}?quality=${DOWNLOAD_QUALITY}`;
 
-    try {
-        let offset = meta.completedBytes || 0;
-        let chunkIndex = offset > 0 ? Math.floor(offset / CHUNK_BYTES) : 0;
-        const knownTotal = meta.totalBytes || null;
-        const knownEtag = meta.etag || null;
-
-        // First request doubles as the probe: exact range + header learning.
-        for (;;) {
-            if (signal.aborted) break;
-            if (knownTotal !== null && offset >= knownTotal) break;
-
-            const start = offset;
-            const end = knownTotal !== null ? Math.min(start + CHUNK_BYTES - 1, knownTotal - 1) : start + CHUNK_BYTES - 1;
-
-            let result = null;
-            let chunkAttempts = 0;
-            let lastChunkError = null;
-            while (chunkAttempts < MAX_CHUNK_ATTEMPTS) {
-                chunkAttempts++;
-                try {
-                    result = await fetchChunk(streamUrl, start, end, knownTotal, signal);
-                    break;
-                } catch (error) {
-                    if (signal.aborted) throw error;
-                    lastChunkError = error;
-                    // Permanent-ish: wrong key / content not found — no retry.
-                    if (error instanceof ApiError && (error.kind === 'unauthorized' || error.kind === 'notFound')) throw error;
-                    if (chunkAttempts >= MAX_CHUNK_ATTEMPTS) break;
-                    await sleep(500 * Math.pow(2, chunkAttempts - 1) + Math.random() * 300);
-                }
-            }
-            if (!result) {
-                throw lastChunkError || new Error('chunk fetch failed');
-            }
-
-            // Validate the object has not changed underneath us.
-            if (result.etag && knownEtag && result.etag !== knownEtag) {
-                // Object changed → restart cleanly rather than joining bytes.
-                await removeRecords(id);
-                meta = { ...meta, completedBytes: 0, totalBytes: 0, etag: null, status: 'downloading', updatedAt: Date.now() };
-                await putRecord(VIDEOS_STORE, meta);
-                offset = 0;
-                chunkIndex = 0;
-                continue;
-            }
-            if (knownTotal !== null && result.totalBytes !== null && result.totalBytes !== knownTotal) {
-                if (meta.completedBytes > 0) {
-                    await removeRecords(id);
-                    meta = { ...meta, completedBytes: 0, totalBytes: 0, etag: null, status: 'downloading', updatedAt: Date.now() };
-                    await putRecord(VIDEOS_STORE, meta);
-                    offset = 0;
-                    chunkIndex = 0;
-                    continue;
-                }
-            }
-
-            const total = result.totalBytes ?? knownTotal;
-            if (total === null && !result.fullBody) {
-                // Server gave no length; finish this chunk and stop cleanly.
-                await persistChunk(id, chunkIndex, start, end, result.blob);
-                meta.completedBytes = end + 1;
-                meta.updatedAt = Date.now();
-                break;
-            }
-            if (total !== null) meta.totalBytes = total;
-            if (result.etag && !meta.etag) meta.etag = result.etag;
-            if (result.lastModified) meta.lastModified = result.lastModified;
-
-            if (result.fullBody) {
-                // Whole-entity 200 fallback (only possible from start==0):
-                // slice the full body into persisted chunk blobs as it lands.
-                const fullBlob = result.blob;
-                const fullTotal = result.totalBytes ?? fullBlob.size;
-                meta.totalBytes = fullTotal;
-                const blobParts = Math.ceil(fullTotal / CHUNK_BYTES);
-                for (let part = 0; part < blobParts; part++) {
-                    if (signal.aborted) break;
-                    const pStart = part * CHUNK_BYTES;
-                    const pEnd = Math.min(pStart + CHUNK_BYTES - 1, fullTotal - 1);
-                    const slice = fullBlob.slice(pStart, pEnd + 1, meta.mimeType || 'video/mp4');
-                    await persistChunk(id, part, pStart, pEnd, slice);
-                    meta.completedBytes = pEnd + 1;
-                    meta.updatedAt = Date.now();
-                    await putRecord(VIDEOS_STORE, meta);
-                    if (Date.now() - lastProgressEvent(id) >= PROGRESS_EVENT_MS) {
-                        emitProgress(id, meta.completedBytes / fullTotal, meta.completedBytes);
-                    }
-                }
-                offset = meta.completedBytes;
-                break;
-            }
-
-            // Verify the Content-Range matches exactly what we asked for.
-            await persistChunk(id, chunkIndex, start, end, result.blob);
-            meta.completedBytes = Math.min(end + 1, meta.totalBytes || end + 1);
-            meta.updatedAt = Date.now();
-            await putRecord(VIDEOS_STORE, meta);
-            if (meta.totalBytes > 0) {
-                const progress = Math.min(1, meta.completedBytes / meta.totalBytes);
-                emitProgress(id, progress, meta.completedBytes);
-            }
-
-            offset = end + 1;
-            chunkIndex++;
+    const adoptValidators = (etag, lastModified) => {
+        if (etag !== null && etag !== undefined) {
+            knownEtag = etag;
+            knownEtagStrong = isStrongEtag(etag);
         }
-
-        if (signal.aborted) {
-            throw abortError();
+        if (lastModified !== null && lastModified !== undefined) {
+            knownLastModified = lastModified;
         }
+    };
 
-        // Verify we actually reached the end.
-        const finalMeta = await getDownload(id);
-        const totalNow = finalMeta && finalMeta.totalBytes;
-        if (totalNow && meta.completedBytes < totalNow) {
-            // Unexpected stop (e.g. a chunk retry exhausted) — paused.
-            meta.status = 'paused';
-            meta.updatedAt = Date.now();
-            await putRecord(VIDEOS_STORE, meta);
-            controllers.delete(id);
-            emitChanged(id);
-            return { id, status: 'paused' };
+    /** Detect whether the representation changed under our feet. */
+    const representationChanged = (etag, lastModified, total) => {
+        const newStrong = isStrongEtag(etag);
+        if (knownEtag !== null && etag !== null && etag !== knownEtag && (knownEtagStrong || newStrong)) {
+            return true; // changed established ETag (either side strong)
         }
+        if (knownEtagStrong && (etag === null || etag === undefined)) {
+            return true; // loss of an established strong validator
+        }
+        if (knownTotal !== null && total !== null && knownTotal !== total) {
+            return true; // changed total
+        }
+        if (
+            !knownEtagStrong &&
+            knownLastModified !== null &&
+            lastModified !== null &&
+            knownLastModified !== lastModified &&
+            (knownEtag === null || knownEtag === etag || etag === null || etag === undefined)
+        ) {
+            return true; // Last-Modified establishes identity when no strong ETag exists
+        }
+        return false;
+    };
 
-        meta.status = 'ready';
-        meta.progress = 1;
+    /** One permitted clean restart for this invocation. */
+    const restartForNewRepresentation = async (etag, lastModified, total) => {
+        if (sourceRestarts >= MAX_SOURCE_RESTARTS) {
+            throw rangeError('sourceChanged');
+        }
+        sourceRestarts++;
+        // Discard only this video's partial chunks + revoke its cached
+        // playback URL, then atomically reset progress/metadata.
+        revokeOfflineUrl(id);
+        await withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
+            const videos = tx.objectStore(VIDEOS_STORE);
+            const chunks = tx.objectStore(CHUNKS_STORE);
+            deleteChunkRangeInTx(chunks, id);
+            const reset = {
+                ...meta,
+                status: 'downloading',
+                completedBytes: 0,
+                chunkCount: 0,
+                totalBytes: Number.isSafeInteger(total) && total > 0 ? total : 0,
+                etag: etag || null,
+                etagStrong: isStrongEtag(etag),
+                lastModified: lastModified || null,
+                updatedAt: Date.now()
+            };
+            videos.put(reset);
+        });
+        offset = 0;
+        nextChunkIndex = 0;
+        knownTotal = Number.isSafeInteger(total) && total > 0 ? total : null;
+        knownEtag = etag || null;
+        knownEtagStrong = isStrongEtag(etag);
+        knownLastModified = lastModified || null;
+        meta.completedBytes = 0;
+        meta.chunkCount = 0;
+        meta.totalBytes = knownTotal || 0;
+        meta.etag = knownEtag;
+        meta.etagStrong = knownEtagStrong;
+        meta.lastModified = knownLastModified;
         meta.updatedAt = Date.now();
-        await putRecord(VIDEOS_STORE, meta);
-        controllers.delete(id);
+        emitChanged(id);
+    };
 
-        if (!persistRequested && navigator.storage && typeof navigator.storage.persist === 'function') {
-            persistRequested = true;
-            navigator.storage.persist().catch(() => {});
+    // offset===total is authoritative only when every byte is covered by a
+    // committed chunk; chunks are committed contiguously so offset alone
+    // equals coverage whenever we advanced through persisted chunks.
+    const canFinish = (total) => Number.isSafeInteger(total) && total >= 0 && offset === total;
+
+    for (;;) {
+        if (signal.aborted) throw abortError();
+
+        if (knownTotal !== null) {
+            if (offset > knownTotal) {
+                // Offset past the total is corruption, not completion.
+                throw rangeError('rangeInvalid');
+            }
+            if (canFinish(knownTotal)) {
+                // Complete only when a numeric total + exact committed byte
+                // count agree (contiguous by construction).
+                break;
+            }
         }
-        emitChanged(id);
-        return { id, status: 'ready' };
-    } catch (error) {
-        controllers.delete(id);
-        const cancelled = error && (error.name === 'AbortError' || error.name === 'cancelled');
-        if (cancelled) {
-            // Explicit cancel — see cancelDownload(); records removed there.
-            throw abortError();
+
+        const start = offset;
+        const end =
+            knownTotal !== null ? Math.min(start + CHUNK_BYTES - 1, knownTotal - 1) : start + CHUNK_BYTES - 1;
+
+        const result = await requestChunk(streamUrl, start, end, signal);
+        if (signal.aborted) throw abortError();
+
+        if (result.kind === 'unsatisfied') {
+            const { total } = result;
+            if (knownTotal === null) {
+                // No bytes committed yet: learn the authoritative total and
+                // continue (or finish immediately when the file is empty).
+                if (total === 0 && offset === 0) {
+                    knownTotal = 0;
+                    break;
+                }
+                if (total > 0 && offset === 0) {
+                    knownTotal = total;
+                    continue; // loop re-checks completion with a known total
+                }
+                throw rangeError('rangeInvalid');
+            }
+            if (total === knownTotal) {
+                if (canFinish(knownTotal)) {
+                    // 416 after verified completion, validators consistent.
+                    const changed = representationChanged(result.etag, result.lastModified, total);
+                    if (!changed) break;
+                    throw rangeError('rangeInvalid');
+                }
+                // 416 while bytes are still missing: inconsistent.
+                throw rangeError('rangeInvalid');
+            }
+            // A different N proves representation change → single restart.
+            if (sourceRestarts >= MAX_SOURCE_RESTARTS) {
+                throw rangeError('sourceChanged');
+            }
+            await restartForNewRepresentation(result.etag, result.lastModified, total);
+            continue;
         }
-        // Network loss / repeated chunk failure: KEEP the partial data and
-        // mark the download paused so the next start resumes from here.
-        const latest = await getDownload(id).catch(() => null);
-        if (latest && latest.status !== 'ready') {
-            meta.status = 'paused';
-            meta.updatedAt = Date.now();
-            await putRecord(VIDEOS_STORE, meta).catch(() => {});
+
+        // Representation-change checks happen BEFORE writing anything.
+        if (representationChanged(result.etag, result.lastModified, result.range.total)) {
+            await restartForNewRepresentation(result.etag, result.lastModified, result.range.total);
+            continue;
         }
-        emitChanged(id);
-        return { id, status: 'paused' };
+
+        // Adopt the newly learned total/validators into both local state
+        // and metadata.
+        knownTotal = result.range.total;
+        adoptValidators(result.etag, result.lastModified);
+
+        const respStart = result.range.start;
+        const respEnd = result.range.end;
+        const totalNow = result.range.total;
+
+        meta.completedBytes = respEnd + 1;
+        meta.chunkCount = nextChunkIndex + 1;
+        meta.totalBytes = totalNow;
+        meta.etag = knownEtag;
+        meta.etagStrong = knownEtagStrong;
+        meta.lastModified = knownLastModified;
+        meta.mimeType = result.mimeType || meta.mimeType || 'video/mp4';
+        meta.status = 'downloading';
+        meta.updatedAt = Date.now();
+
+        // Persist the chunk + its updated metadata as ONE transaction.
+        await writeChunkTransaction(id, meta, {
+            key: chunkKey(id, nextChunkIndex),
+            index: nextChunkIndex,
+            start: respStart,
+            end: respEnd,
+            blob: result.blob
+        });
+
+        // Advance from the response's ACTUAL end (shorter valid responses
+        // are fine); never derive the next index with floor(offset/CHUNK).
+        nextChunkIndex = meta.chunkCount;
+        offset = respEnd + 1;
+
+        const total = knownTotal;
+        if (total !== null && total > 0) {
+            const progress = Math.min(1, offset / total);
+            if (Date.now() - throttleProgress(id) >= PROGRESS_EVENT_MS) {
+                emitProgress(id, progress, offset);
+            }
+            if (canFinish(total)) break;
+        } else if (total === 0) {
+            break;
+        }
     }
-}
 
-let lastEmit = new Map();
+    if (knownTotal !== null && offset === knownTotal) {
+        // Ready only after the numeric total, exact committed byte count and
+        // complete ordered chunk coverage agree.
+        const committed = await getRecord(VIDEOS_STORE, id).catch(() => null);
+        const coverage = committed
+            ? await loadValidatedChunks(id).catch(() => ({ chunks: [], validThrough: -1 }))
+            : { chunks: [], validThrough: -1 };
+        const coveredFully =
+            coverage.chunks.length > 0 &&
+            coverage.chunks.length === (committed ? committed.chunkCount : 0) &&
+            coverage.validThrough === knownTotal - 1;
+        if (knownTotal === 0 || coveredFully) {
+            const finalMeta = {
+                ...(committed || meta),
+                status: 'ready',
+                completedBytes: knownTotal,
+                chunkCount: knownTotal === 0 ? 0 : coverage.chunks.length,
+                totalBytes: knownTotal,
+                updatedAt: Date.now()
+            };
+            await putVideoMeta(finalMeta); // ready commits BEFORE progress=1
+            emitProgress(id, 1, knownTotal);
+            emitChanged(id);
 
-function lastProgressEvent(id) {
-    if (!lastEmit.has(id)) lastEmit.set(id, 0);
-    const last = lastEmit.get(id);
-    lastEmit.set(id, Date.now());
-    return last;
-}
+            if (!persistRequested && typeof navigator !== 'undefined' && navigator.storage && typeof navigator.storage.persist === 'function') {
+                persistRequested = true;
+                navigator.storage.persist().catch(() => {});
+            }
+            return { id, status: 'ready' };
+        }
+    }
 
-async function persistChunk(id, index, start, end, blob) {
-    await withStore(CHUNKS_STORE, 'readwrite', (store) =>
-        store.put({ key: chunkKey(id, index), blob, start, end })
-    );
-}
-
-function abortError() {
-    const error = new Error('cancelled');
-    error.name = 'cancelled';
-    return error;
+    // Reached with knownTotal null or incomplete coverage — pause.
+    throw rangeError('rangeTotalUnknown');
 }
 
 /**
  * Cancel an in-flight download AND delete any partial data (explicit user
- * intent — only cancel/delete remove partial downloads).
+ * intent — only cancel/remove delete partial downloads). Cancellation
+ * aborts the operation, AWAITS its settlement, then deletes its records in
+ * a real awaited transaction; a replacement start never begins before that
+ * cleanup completes.
  */
 export async function cancelDownload(id) {
     if (!id) return;
-    const controller = controllers.get(id);
-    if (controller) {
-        controllers.delete(id);
-        controller.abort();
+    const operation = operations.get(id);
+    if (operation) {
+        if (!operation.controller.signal.aborted) operation.controller.abort();
+        if (operation.done) {
+            await operation.done.catch(() => {});
+        }
     }
-    await removeRecords(id).catch(() => {});
+    await deleteVideoData(id);
+    lastEmit.delete(id);
     emitChanged(id);
 }
 
 /** Delete a finished download or cancel+delete an in-flight one. */
 export async function removeDownload(id) {
     if (!id) return;
-    await cancelDownload(id);
+    if (operations.has(id)) {
+        await cancelDownload(id);
+        return;
+    }
+    await deleteVideoData(id);
+    lastEmit.delete(id);
+    emitChanged(id);
 }

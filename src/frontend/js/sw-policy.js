@@ -68,9 +68,26 @@ export function shouldHandleApiRequest(url) {
     return isCacheableApiUrl(url);
 }
 
+/**
+ * Namespace-scoped cache retirement: keys to delete from `allKeys` for a
+ * new generation — every OTHER generation in the yt-core- and
+ * yt-runtime- namespaces (asterisk suffix), and nothing else (unrelated
+ * same-origin caches are never touched).
+ */
+export function cachesToDelete(allKeys, { core, runtime }) {
+  return allKeys.filter((key) => {
+    if (!/^yt-(?:core|runtime)-/.test(key)) return false
+    return key !== core && key !== runtime
+  })
+}
+
 /** A response may be stored only when it is a successful, private-safe GET. */
 export function responseIsCacheable(response) {
     if (!response || !response.ok) return false;
+    // Byte-range media responses are NEVER stored by the worker: the Cache
+    // API cannot preserve Range semantics and offline files belong to the
+    // IndexedDB downloader.
+    if (response.status === 206 || response.status === 416) return false;
     if (response.status === 401 || response.status === 403 || response.status === 429) return false;
     if (response.status >= 500) return false;
     const cacheControl = response.headers.get('Cache-Control') || '';

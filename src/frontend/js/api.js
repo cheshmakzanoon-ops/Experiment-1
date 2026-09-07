@@ -34,7 +34,14 @@ export const ERROR_LABELS = {
     rateLimited: 'سرور شلوغ است — کمی بعد دوباره تلاش کنید',
     serverUnavailable: 'سرور در دسترس نیست — کمی بعد تلاش کنید',
     permanent: 'خطا در دریافت اطلاعات',
-    aborted: 'درخواست لغو شد'
+    aborted: 'درخواست لغو شد',
+    // Offline-download taxonomy (technical codes stable, messages Persian):
+    rangeUnsupported: 'سرور دانلود بخشی را پشتیبانی نمی‌کند',
+    rangeInvalid: 'پاسخ دانلود نامعتبر بود',
+    rangeTotalUnknown: 'اندازه فایل مشخص نیست — دانلود ممکن نیست',
+    sourceChanged: 'نسخه ویدیو در سرور تغییر کرد',
+    storage: 'فضای ذخیره‌سازی پر است یا در دسترس نیست',
+    authStorage: 'ذخیره نشست در دسترس نیست — کمی بعد وارد شوید'
 };
 
 export class ApiError extends Error {
@@ -121,12 +128,26 @@ export async function loginWithKey(key) {
     return true;
 }
 
-/** Log out (expires the cookie server-side). */
+/**
+ * Log out (server-side allowlist removal + cookie expiry). Checks the
+ * DELETE response: server storage failure must surface instead of always
+ * announcing a successful logout.
+ */
 export async function logout() {
+    let response = null;
     try {
-        await fetch(`${API_BASE}/session`, { method: 'DELETE', credentials: 'same-origin' });
-    } catch {
-        // offline — nothing else to do
+        response = await fetch(`${API_BASE}/session`, { method: 'DELETE', credentials: 'same-origin' });
+    } catch (error) {
+        throw new ApiError('offline', { cause: error });
+    }
+    if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        if (response.status === 503 && body && body.code === 'AUTH_STORAGE_UNAVAILABLE') {
+            const error = new ApiError('authStorage', { status: 503 });
+            error.code = 'AUTH_STORAGE_UNAVAILABLE';
+            throw error;
+        }
+        throw new ApiError(response.status === 401 ? 'unauthorized' : 'serverUnavailable', { status: response.status });
     }
     document.dispatchEvent(new CustomEvent('auth:changed', { detail: { authenticated: false } }));
 }
@@ -344,6 +365,43 @@ function ensureAuthenticatedOnce() {
             });
     }
     return authenticating;
+}
+
+function gateAbortError() {
+    const error = new Error('Log-in cancelled');
+    error.name = 'AbortError';
+    return error;
+}
+
+/**
+ * Wait for the shared login gate WITHOUT cancelling another caller's login
+ * interaction; stop waiting when the caller's own signal aborts (used by
+ * the offline downloader after a 401). Rejects with an AbortError on
+ * cancellation; resolves true once a session exists.
+ */
+export function waitForGateOrAbort(signal) {
+    if (signal && signal.aborted) {
+        return Promise.reject(gateAbortError());
+    }
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const onAbort = () => {
+            if (done) return;
+            done = true;
+            const index = gateWaiters.indexOf(waiter);
+            if (index >= 0) gateWaiters.splice(index, 1);
+            if (signal) signal.removeEventListener('abort', onAbort);
+            reject(gateAbortError());
+        };
+        const waiter = (ok) => {
+            if (done) return;
+            done = true;
+            if (signal) signal.removeEventListener('abort', onAbort);
+            resolve(ok);
+        };
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        gateWaiters.push(waiter);
+    });
 }
 
 // ---------------------------------------------------------------------------

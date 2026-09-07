@@ -23,7 +23,7 @@ import { OutboundFetchError, safeFetchMedia } from '../../utils/net.js'
 import { assertSafeMediaUrl, UnsafeUrlError } from '../../utils/urlValidator.js'
 import { forwardRangeHeader, parseRangeHeader, contentRangeForUnsatisfiable, resolveRange, formatContentRange } from '../../utils/range.js'
 import { streamCache, type StreamCacheEntry, type StreamMeta } from '../../middleware/streamCache.js'
-import { QueueFullError, QueueTimeoutError } from '../ytdlp/queue.js'
+import { QueueFullError, QueueTimeoutError, createAbortError, isAbortError } from '../ytdlp/queue.js'
 import { logger } from '../../utils/logger.js'
 import { config } from '../../config.js'
 
@@ -47,17 +47,22 @@ export interface ResolvedStreamSource {
 }
 
 // ---------------------------------------------------------------------------
-// Resolution (cache → extraction) with local single-flight dedupe
+// Resolution (cache → extraction; single-flight lives in the runner)
 // ---------------------------------------------------------------------------
 
-const resolutionFlights = new Map<string, Promise<ResolvedStreamSource>>()
-
-function resolutionKey(videoId: string, maxHeight: number, force: boolean): string {
-  return `${videoId}:${maxHeight}:${force ? 'f' : 'c'}`
-}
-
-async function extractSource(videoId: string, maxHeight: number): Promise<ResolvedStreamSource> {
-  const { info, stream } = await extractPlayableVideo(videoId, maxHeight)
+/**
+ * Extract + validate + cache ONE source. The bounded runner deduplicates
+ * identical raw extractions (`extract:${videoId}` gate key); each resolver
+ * caller independently awaits its own extraction here — no local flight
+ * map to desynchronize from the runner's signal handling.
+ */
+async function extractSource(
+  videoId: string,
+  maxHeight: number,
+  signal?: AbortSignal
+): Promise<ResolvedStreamSource> {
+  // Cancel before extraction (the runner rejects pre-aborted operations).
+  const { info, stream } = await extractPlayableVideo(videoId, maxHeight, { signal })
   // Refuse to even cache a URL we would not relay.
   const safeUrl = assertSafeMediaUrl(stream.url)
   const source: ResolvedStreamSource = {
@@ -76,6 +81,10 @@ async function extractSource(videoId: string, maxHeight: number): Promise<Resolv
     thumbnail: info.thumbnail || '',
     viewCount: info.view_count || 0,
     fromCache: false
+  }
+  // Cancel before writing the stream cache (never commit after abort).
+  if (signal?.aborted) {
+    throw createAbortError('Extraction cancelled')
   }
   streamCache.set(videoId, maxHeight, source)
   return source
@@ -101,7 +110,7 @@ function fromCacheEntry(videoId: string, maxHeight: number, entry: StreamCacheEn
   }
 }
 
-/** Resolve the proxiable stream, deduplicating identical resolutions. */
+/** Resolve the proxiable stream (cache hit or one bounded extraction). */
 export async function resolveStreamSource(
   videoId: string,
   maxHeight: number,
@@ -116,16 +125,10 @@ export async function resolveStreamSource(
     }
   }
 
-  const key = resolutionKey(videoId, maxHeight, forceRefresh)
-  const existing = resolutionFlights.get(key)
-  if (existing) return existing
-
   logger.debug('stream cache miss', { videoId, maxHeight, forceRefresh })
-  const flight = extractSource(videoId, maxHeight).finally(() => {
-    resolutionFlights.delete(key)
-  })
-  resolutionFlights.set(key, flight)
-  return flight
+  // Each resolver caller awaits its own extraction; identical concurrent
+  // raw extractions are single-flighted inside the runner by video id.
+  return extractSource(videoId, maxHeight, options.signal)
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +328,9 @@ export interface StreamFailure {
 }
 
 export function mapStreamFailure(error: unknown): StreamFailure {
+  if (isAbortError(error)) {
+    return { status: 499, code: 'CLIENT_ABORT', error: 'Request aborted' }
+  }
   if (error instanceof QueueFullError) {
     return { status: 503, code: 'SERVER_BUSY', error: 'Server is busy — try again shortly', retryAfterSeconds: error.retryAfterSeconds }
   }

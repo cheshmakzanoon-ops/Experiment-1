@@ -25,16 +25,26 @@ wrapper turns it into an installable app.
   Chromium are needed: the app selects a single progressive media URL and
   byte-relays it, and yt-dlp’s JavaScript-challenge (EJS) support runs on
   Node 22 itself via `--js-runtimes node` in the centralized runner.
-- Resolution order for the yt-dlp executable:
-  1. `YT_DLP_PATH` (explicit operator override),
-  2. `.runtime/bin/yt-dlp` (repository-local, bootstrapped),
-  3. `yt-dlp` on `PATH`.
+- Resolution order for the yt-dlp executable (NO implicit `PATH` fallback):
+  1. `YT_DLP_PATH` (explicit operator override — must be an absolute path to
+     a binary that answers `--version` with EXACTLY the effective requested
+     version; never overwritten, never claimed as checksum-verified unless
+     the operator verifies it themselves),
+  2. `.runtime/bin/yt-dlp` (repository-local, bootstrapped and verified).
+- One effective requested version is used everywhere: trimmed
+  `YT_DLP_VERSION`, otherwise `defaultVersion` in
+  `src/config/ytdlp-version.json` (release-tag syntax validated).
 - `npm run bootstrap:runtime` downloads the pinned release (architecture
-  aware: `yt-dlp_linux` / `yt-dlp_linux_aarch64`), verifies its SHA-256
-  against the official release checksum file, and installs it under
-  `.runtime/bin/`. It is idempotent: a second run never re-downloads a
-  valid installed binary. `npm start` runs `prestart` (an idempotent
-  runtime verification) before booting.
+  aware: `yt-dlp_linux` / `yt-dlp_linux_aarch64` / `yt-dlp.exe`), verifies
+  its SHA-256 against the official release SHA2-256SUMS, probes the exact
+  version, and atomically installs it under `.runtime/bin/` with a small
+  verification receipt (`.runtime/bin/.yt-dlp.verified.json`). A second run
+  re-hashes the binary against the receipt and never re-downloads a valid
+  install; when the receipt is missing/stale it re-verifies against the
+  official checksum manifest instead of trusting existing bytes.
+  `npm start` runs `prestart` (the same idempotent verification) before
+  booting, and `node dist/index.js` direct startup also runs the ensure
+  script as a bounded child first.
 - To **update yt-dlp deliberately**: bump `defaultVersion` in
   `src/config/ytdlp-version.json`, then run
   `npm run bootstrap:runtime -- --force` and re-run the verification suite.
@@ -92,22 +102,44 @@ The old design (a public `/api/config` that handed out the API key, keys in
 `?key=…` query strings) is gone.
 
 - `POST /api/session` with the household `ACCESS_KEY` in a JSON body
-  (constant-time comparison) issues a signed **HttpOnly** cookie:
+  (constant-time comparison) **persists a new active session to the session
+  store first** and only then issues the signed **HttpOnly** cookie:
   `SameSite=Strict`, `Path=/`, `Secure` in production, default 30-day
-  lifetime (`SESSION_TTL_DAYS`). The cookie value carries an expiry and is
-  HMAC-signed with `SESSION_SECRET`.
+  lifetime (`SESSION_TTL_DAYS`) — one lifetime source for both the token
+  expiration and the cookie Max-Age.
+- **Active sessions are an allowlist, not a revoked-token blacklist.**
+  `src/services/sessionStore.ts` keeps a versioned document
+  (`{version: 1, epoch, active: [{sid, exp}]}`) at
+  `.runtime/auth/sessions.json` (override with `SESSION_STORE_PATH`),
+  written atomically through one serializer (temp file + fsync + rename +
+  dir sync). Sessions survive server restarts; a genuinely lost/corrupted
+  store fails startup (never silently replaced with a fresh one), and an
+  *ephemeral* filesystem (e.g. a Freebuff rebuild) rotates the epoch,
+  invalidating every old cookie — one fresh login is required after a
+  deployment upgrade. Capacity is capped at 5,000 active sessions (after
+  pruning expired ones); a full store rejects new login with 503
+  `AUTH_SESSIONS_FULL` and never evicts an unexpired session.
+- The signed payload is `{v:2, epoch, sid, exp}` — matching store epoch +
+  active-allowlist membership are required. Storage failures return
+  `AUTH_STORAGE_UNAVAILABLE` (never a false success) and make
+  authentication/readiness fail closed until recovery. **Topology: one
+  Node process/replica — do not run multiple replicas against independent
+  JSON files.**
 - Same-origin `<img>`/`<video>`/fetch requests carry the cookie
   automatically, so no secret ever appears in JavaScript, a URL, logs or
   history.
 - `GET /api/session` reports only `{authenticated, authMode}` — never a
-  secret. `DELETE /api/session` revokes the token server-side **and**
-  expires the cookie.
+  secret or the store epoch. `DELETE /api/session` **persists the removal
+  before** expiring the cookie; the frontend surfaces a failed logout
+  instead of claiming success.
 - **Public by design:** liveness/readiness health endpoints and the
   session lifecycle. Everything else (`/api/search`, feeds, metadata,
   thumbnails, streams, stats, diagnostics) requires a session. In
-  production, missing `ACCESS_KEY`/`SESSION_SECRET` aborts startup.
+  production, missing `ACCESS_KEY`/`SESSION_SECRET` aborts startup, and
+  partial credential configurations are rejected in **every** environment.
   `AUTH_DISABLED=true` is the only sanctioned development escape hatch and
-  is refused in production.
+  is accepted only when `NODE_ENV` is `development`/`test` AND `HOST`
+  resolves to the literal loopback binding (`127.0.0.1` or `::1`).
 - Rate limiting is mounted by class (login attempts: very low; metadata/
   feeds: moderate; extraction-triggering calls: low; diagnostics:
   extremely low) and returns accurate `Retry-After` values. Client
@@ -133,6 +165,39 @@ The old design (a public `/api/config` that handed out the API key, keys in
   triggers re-extraction storms.
 - Request cancellation propagates upstream (phone disconnects → upstream
   fetch aborted).
+
+## Offline downloads (IndexedDB) and its intentional Range limitations
+
+The Library → آفلاین downloader stores video chunks in IndexedDB (per-video
+chunk records + one metadata record, written in a single transaction) for
+playback with the network disabled. The downloader's HTTP contract is
+**stricter than ordinary playback** on purpose:
+
+- **Every chunk response must be a truthful 206.** `Content-Range` is
+  parsed into `{start, end, total}` with strict integer validation; the
+  response start must equal the requested start, the body length must be
+  counted and match, and shorter-than-requested valid responses are
+  accepted (progress advances from the response's actual end).
+- **Unknown totals are unsupported** — a `bytes S-E/*` 206 pauses with
+  `RANGE_TOTAL_UNKNOWN`; the downloader never marks an unknown-length
+  prefix ready. Totals are learned from responses and re-validated against
+  the extractor's `filesize_approx`, which is treated as an estimate only.
+- **A full HTTP 200 in answer to an offline Range request is unsupported:**
+  the body is cancelled immediately and the download pauses with
+  `RANGE_UNSUPPORTED` — the downloader never buffers a full media object.
+  Ordinary online playback's truthful 200 relay is unchanged.
+- 416 is parsed separately (`bytes */N`): it completes a download only when
+  N matches the established total and persisted coverage is exactly
+  `[0,N)`; otherwise it drives the single permitted representation-change
+  restart (`SOURCE_CHANGED`) rather than marking incomplete data ready.
+- **Representation changes** (changed strong ETag / total / Last-Modified
+  without a strong ETag) restart that video's download once from zero after
+  discarding only its incompatible chunks; a second change pauses with
+  `SOURCE_CHANGED`.
+- Integrity checks reject wrong starts/ends, truncation, overflow, gaps and
+  overlap; committed chunks and metadata are never left half-written, and
+  user cancellation deletes only that video's records (awaited transaction)
+  before allowing a restart.
 
 ## Feeds & search
 
@@ -164,8 +229,11 @@ as bot detection, permanent failures are never blindly retried, and a real
 - `GET /api/health/live` — cheapest possible process-liveness check.
 - `GET /api/health/ready` — cached (45 s) local prerequisite check:
   configuration valid, Node ≥ 22, yt-dlp resolves and runs, JS runtime
-  supported. Returns 503 with a precise reason when the runtime is missing.
-  It never performs a YouTube extraction — readiness ≠ YouTube reachability.
+  supported, session store healthy. Returns 503 with a precise reason
+  (`RUNTIME_MISSING`, `YTDLP_VERSION_MISMATCH`, `SHUTTING_DOWN`, …) when a
+  prerequisite is missing or the server is shutting down. It never performs
+  a YouTube extraction and never exposes the session-store epoch/session
+  list — readiness ≠ YouTube reachability.
 - `GET /api/diag/*` are **disabled by default** (`ENABLE_DIAGNOSTICS=false`
   → 404). When enabled they require a session, an extremely strict rate
   limit, a single-flight deep-test lock, finite timeouts, and redact all
@@ -197,20 +265,21 @@ Secrets are marked 🔒 — set them in the platform env UI / deployment env;
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `NODE_ENV` | `development` | `production` enables fail-closed auth and `Secure` cookies |
+| `NODE_ENV` | `development` | accepted values: `production`, `development`, `test`; any other nonempty value is rejected at startup |
 | `PORT` | `3000` | listen port (Freebuff injects it) |
-| `HOST` | `0.0.0.0` | listen host |
-| `ACCESS_KEY` 🔒 | – | household access key (required in production) |
-| `SESSION_SECRET` 🔒 | – | HMAC signing secret, ≥ 16 chars (required in production) |
-| `AUTH_DISABLED` | `false` | explicit dev-only auth bypass (refused in production) |
-| `SESSION_TTL_DAYS` | `30` | household cookie lifetime |
+| `HOST` | `0.0.0.0` | listen host (`AUTH_DISABLED=true` additionally requires the literal `127.0.0.1`/`::1` loopback binding) |
+| `ACCESS_KEY` 🔒 | – | household access key, ≥ 16 chars — required in EVERY environment unless the loopback dev exception applies |
+| `SESSION_SECRET` 🔒 | – | HMAC signing secret, ≥ 32 UTF-8 bytes — required in EVERY environment unless the loopback dev exception applies |
+| `AUTH_DISABLED` | `false` | strict flag (`true`/`false`/absent only — typos are rejected); bypass allowed only in development/test on an explicit loopback binding, never in production or on a wildcard/network binding |
+| `SESSION_TTL_DAYS` | `30` | household cookie lifetime (single source for token expiry + cookie Max-Age) |
+| `SESSION_STORE_PATH` | `.runtime/auth/sessions.json` | absolute path to the persisted active-session allowlist (repo-root-relative default; directory must be writable, single-replica topology) |
 | `TRUST_PROXY` | `false` | trust `X-Forwarded-For`/`X-Real-IP` for rate-limit keys |
 | `LOGIN_MAX_REQUESTS` / `LOGIN_WINDOW_MS` | `8` / `15 min` | login attempt limits |
 | `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW` | `120` / `60 s` | ordinary API calls |
 | `EXTRACT_MAX_REQUESTS` / `EXTRACT_WINDOW_MS` | `20` / `60 s` | extraction-triggering calls |
 | `DIAG_MAX_REQUESTS` / `DIAG_WINDOW_MS` | `4` / `10 min` | diagnostics |
-| `YT_DLP_VERSION` | pinned default | override of the single-source version pin |
-| `YT_DLP_PATH` | – | explicit trusted yt-dlp binary path |
+| `YT_DLP_VERSION` | pinned default | override of the single-source version pin (trimmed; release-tag syntax validated) |
+| `YT_DLP_PATH` | – | explicit operator-managed binary — absolute path whose `--version` output EXACTLY matches the effective requested version (mismatch fails with instructions) |
 | `YT_DLP_CONCURRENCY` | `2` | max simultaneous yt-dlp processes |
 | `YT_DLP_QUEUE_MAX` | `24` | max waiting jobs before `503` |
 | `YT_DLP_QUEUE_TIMEOUT_MS` | `45000` | max queue wait |
@@ -231,10 +300,17 @@ Secrets are marked 🔒 — set them in the platform env UI / deployment env;
 ## Testing & verification
 
 - `npm run lint` — ESLint (no-undef etc.) over the frontend.
-- `npm test` — the real Vitest suite (Range parsing/resolution, session
-  auth incl. tamper/expiry/logout revocation, URL allowlist + redirect
-  re-validation, strict numeric validation, feed batch pagination,
-  yt-dlp failure classification, concurrency gate, config fail-closed).
+- `npm test` — the real Vitest suite (~200 tests across 17 files): Range
+  parsing/resolution, fail-closed configuration, strict `AUTH_DISABLED`,
+  session auth incl. tamper/expiry and logout, the persistent session store
+  (restart survival, epoch rotation, corruption fail-closed, capacity,
+  write-failure unavailability), the offline downloader contract against
+  `fake-indexeddb` (strict 206 validation, bounded counted reads, chunked
+  resume, transactional persistence, cancellation), single-flight gate
+  cancellation with independent waiters + real SIGTERM-ignoring child
+  escalation, ordered shutdown fencing, the pinned-runtime installer
+  (mocked network, real filesystem/hash/probe), the smoke acceptance
+  script, and the service-worker namespace-scoped cache policy.
 - `npm run build` / `npm run typecheck`.
 - **`scripts/smoke.mjs`** — external smoke test against a *deployed*
   Freebuff URL. The access key must be passed via `FREEBUFF_SMOKE_KEY`
@@ -245,9 +321,10 @@ Secrets are marked 🔒 — set them in the platform env UI / deployment env;
   It verifies shell/liveness/readiness/auth/search/metadata/thumbnails,
   exact byte ranges (first, mid-file, suffix, malformed → 416,
   unsatisfiable → 416 `bytes */TOTAL`), no signed-URL leakage, and
-  diagnostics-off-by-default, and reports distinct failure categories
-  (`freebuff_ingress`, `auth`, `runtime_missing`, `extraction_blocked`,
-  `cdn_blocked`, `range_corruption`, `timeout`). Running it against
+  diagnostics-off-by-default,  and reports distinct failure categories (`freebuff_ingress`, `auth`,
+  `runtime_missing`, `version_mismatch`, `shutting_down`,
+  `extraction_blocked`, `cdn_blocked`, `range_corruption`, `timeout`).
+  Running it against
   `localhost` proves only the local process — the real ingress, Range
   survival through the reverse proxy, and phone/Iran reachability are
   separate checks to run against the live preview URL (see TESTING.md).
@@ -256,12 +333,14 @@ Secrets are marked 🔒 — set them in the platform env UI / deployment env;
 
 ```
 src/
-  index.ts               # server entry (security headers, routing, shutdown)
+  index.ts               # server entry (security headers, routing, ordered shutdown)
   config.ts              # env config (fail-closed validation)
   config/ytdlp-version.json  # single yt-dlp version pin
   middleware/            # session auth, rate limiting, stream cache/counters
   routes/                # session, search, feed, video, stream, health, diag
   services/
+    sessionStore.ts      # persisted active-session allowlist (atomic writes)
+    shutdownState.ts     # shutdown fence consulted by readiness
     ytdlp/               # runtime resolution + bounded runner (queue, errors)
     youtube/             # extractor, feeds/search, stream proxy
     cache/               # bounded TTL + stale-if-error caches
@@ -269,8 +348,8 @@ src/
   utils/                 # range parsing, URL allowlist, outbound net, params
   frontend/              # Persian RTL UI (self-hosted fonts/icons)
 android/                 # WebView wrapper (see android/README.md)
-scripts/                 # runtime bootstrap + smoke test
-tests/                   # Vitest suite
+scripts/                 # pinned-runtime bootstrap/ensure + smoke test
+tests/                   # Vitest suite (17 files incl. offline/session-store/cancellation/shutdown/runtime-bootstrap/smoke/sw-policy)
 ```
 
 See **TESTING.md** for the ordered validation guide and **android/README.md**

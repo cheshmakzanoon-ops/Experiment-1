@@ -6,17 +6,37 @@
  * ever read here and must never be logged, echoed to clients, or placed in
  * query strings.
  *
- * Production (`NODE_ENV=production`) FAILS CLOSED: missing ACCESS_KEY or
- * SESSION_SECRET aborts startup instead of silently serving the private
- * household proxy to anyone who can reach the URL.
+ * Authentication FAILS CLOSED in every environment:
+ *   - NODE_ENV must be `production`, `development` or `test` (an omitted
+ *     value stays `development`, but that never disables authentication),
+ *   - AUTH_DISABLED accepts exactly `true` / `false` / absent / empty,
+ *   - AUTH_DISABLED=true is permitted ONLY in development/test with HOST
+ *     explicitly bound to a loopback literal (127.0.0.1 / ::1) — never in
+ *     production and never on a wildcard/network binding,
+ *   - otherwise both ACCESS_KEY (≥ 16 characters) and SESSION_SECRET
+ *     (≥ 32 UTF-8 bytes) are required, with no partial configurations.
  */
 
+import { fileURLToPath } from 'node:url'
+import { resolve } from 'node:path'
 import ytdlpVersionInfo from './config/ytdlp-version.json' with { type: 'json' }
 
 export const NODE_VERSION_MIN = 22
 
 /** Default pinned yt-dlp baseline (single source of truth). */
 export const DEFAULT_YT_DLP_VERSION: string = ytdlpVersionInfo.defaultVersion
+
+export const NODE_ENVS = ['production', 'development', 'test'] as const
+export type NodeEnv = (typeof NODE_ENVS)[number]
+
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
+
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConfigError'
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Small typed helpers
@@ -51,15 +71,44 @@ function listFromEnv(key: string): string[] {
     .filter((s) => s.length > 0)
 }
 
+/**
+ * Strict AUTH_DISABLED parsing — NOT the permissive general boolean helper.
+ * After trimming/lowercasing only `true`, `false` or absent/empty are
+ * accepted; typo'd values (`flase`, `yesplease`, `disabled`) are rejected
+ * instead of being silently coerced.
+ */
+export function parseAuthDisabledFlag(raw: string | undefined | null): boolean {
+  if (raw === undefined || raw === null) return false
+  const value = raw.trim().toLowerCase()
+  if (value === '') return false
+  if (value === 'true') return true
+  if (value === 'false') return false
+  throw new ConfigError(
+    `AUTH_DISABLED has an unrecognized value — use exactly "true" or "false" (or omit it).`
+  )
+}
+
+/** Accepted environment names only; empty retains the development default. */
+export function parseNodeEnv(raw: string | undefined | null): NodeEnv {
+  const value = (raw ?? '').trim()
+  if (value === '') return 'development'
+  if ((NODE_ENVS as readonly string[]).includes(value)) return value as NodeEnv
+  throw new ConfigError(
+    `NODE_ENV must be one of: ${NODE_ENVS.join(', ')} (got "${value}"). Refusing to start with an unknown environment.`
+  )
+}
+
 export interface AppConfig {
   port: number
   host: string
-  nodeEnv: 'production' | 'development' | 'test'
+  nodeEnv: NodeEnv
+  /** Raw NODE_ENV value (validated at startup; empty = development). */
+  nodeEnvRaw: string
 
   // ---- Auth / session -----------------------------------------------------
   accessKey: string
   sessionSecret: string
-  /** Explicitly disable access control (development only). */
+  /** Explicitly disable access control (development, loopback only). */
   authDisabled: boolean
   /** Session lifetime for household cookies, in days. */
   sessionTtlDays: number
@@ -67,6 +116,8 @@ export interface AppConfig {
   trustProxy: boolean
   /** Auth / login rate limiting. */
   auth: { loginMax: number; loginWindowMs: number }
+  /** Absolute path of the persistent active-session allowlist document. */
+  sessionStorePath: string
 
   // ---- Rate limiting ------------------------------------------------------
   rateLimit: {
@@ -126,17 +177,28 @@ export interface AppConfig {
   logLevel: 'debug' | 'info' | 'warn' | 'error'
 }
 
+/**
+ * Absolute repository-root-relative session-store path, independent of the
+ * shell's working directory. Overridable with SESSION_STORE_PATH.
+ */
+function defaultSessionStorePath(): string {
+  return resolve(REPO_ROOT, '.runtime', 'auth', 'sessions.json')
+}
+
 export function readConfig(): AppConfig {
-  const nodeEnv = (process.env.NODE_ENV as AppConfig['nodeEnv']) || 'development'
+  const nodeEnvRaw = strFromEnv('NODE_ENV')
+  const nodeEnv = parseNodeEnv(nodeEnvRaw)
   const sessionSecret = strFromEnv('SESSION_SECRET')
   const accessKey = strFromEnv('ACCESS_KEY')
-  // AUTH_DISABLED=true is the only sanctioned way to run without a key.
-  const authDisabled = boolFromEnv('AUTH_DISABLED', false)
+  // AUTH_DISABLED=true is the only sanctioned way to run without a key, and
+  // only on a loopback-bound development/test process (see assertValidConfig).
+  const authDisabled = parseAuthDisabledFlag(process.env.AUTH_DISABLED)
 
   return {
     port: intFromEnv('PORT', 3000, 1, 65535),
     host: strFromEnv('HOST', '0.0.0.0'),
     nodeEnv,
+    nodeEnvRaw,
 
     accessKey,
     sessionSecret,
@@ -147,6 +209,7 @@ export function readConfig(): AppConfig {
       loginMax: intFromEnv('LOGIN_MAX_REQUESTS', 8, 1, 1000),
       loginWindowMs: intFromEnv('LOGIN_WINDOW_MS', 15 * 60 * 1000, 1000)
     },
+    sessionStorePath: strFromEnv('SESSION_STORE_PATH', defaultSessionStorePath()),
 
     rateLimit: {
       apiMax: intFromEnv('RATE_LIMIT_MAX_REQUESTS', 120, 1, 100000),
@@ -197,50 +260,69 @@ export function readConfig(): AppConfig {
 
 export const config: AppConfig = readConfig()
 
-export class ConfigError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'ConfigError'
-  }
-}
-
 /**
- * Validate the environment. In production this is invoked at startup and
- * aborts the process when the private proxy would otherwise run wide open
- * or without a signing secret. Always fails when ACCESS_KEY is set without
- * SESSION_SECRET (a broken half-configuration).
+ * Validate the environment in this exact order, before the listening socket
+ * is ever bound:
+ *   1. NODE_ENV is a recognized environment,
+ *   2. the authentication-disable setting is strictly formed,
+ *   3. the allowed development exception applies (development/test on an
+ *      explicit loopback binding) — otherwise,
+ *   4. both credentials are present and strong enough.
+ * Partial configurations are rejected in every environment.
  */
 export function assertValidConfig(cfg: AppConfig = config): void {
-  const { nodeEnv } = cfg
-
-  if (cfg.nodeEnv !== 'production' && !cfg.authDisabled && cfg.accessKey && !cfg.sessionSecret) {
-    throw new ConfigError('ACCESS_KEY requires SESSION_SECRET — configure both or neither.')
+  // 1. Environment name (empty is permitted and stays `development`).
+  const rawEnv = cfg.nodeEnvRaw === undefined ? cfg.nodeEnv : cfg.nodeEnvRaw
+  const normalizedEnv = (rawEnv ?? '').trim()
+  if (normalizedEnv !== '' && !(NODE_ENVS as readonly string[]).includes(normalizedEnv)) {
+    throw new ConfigError(
+      `NODE_ENV must be one of: ${NODE_ENVS.join(', ')} (got "${normalizedEnv}"). Refusing to start with an unknown environment.`
+    )
   }
 
-  if (cfg.authDisabled) {
-    if (nodeEnv === 'production') {
-      throw new ConfigError('AUTH_DISABLED=true is not allowed in production.')
-    }
-    return // explicitly opted-in development mode
-  }
-
-  if (nodeEnv === 'production') {
-    if (!cfg.accessKey) {
+  // 2. Authentication-disable setting syntax (defensive re-check of the
+  // environment; readConfig already parses this strictly).
+  if (process.env.AUTH_DISABLED !== undefined) {
+    const rawDisabled = String(process.env.AUTH_DISABLED).trim().toLowerCase()
+    if (rawDisabled !== '' && rawDisabled !== 'true' && rawDisabled !== 'false') {
       throw new ConfigError(
-        'ACCESS_KEY is not set. Refusing to start in production without access control. ' +
-          'Set ACCESS_KEY and SESSION_SECRET, or run in development with AUTH_DISABLED=true.'
+        `AUTH_DISABLED has an unrecognized value — use exactly "true" or "false" (or omit it).`
       )
     }
-    if (!cfg.sessionSecret) {
-      throw new ConfigError('SESSION_SECRET is not set. Refusing to start in production.')
-    }
-    if (cfg.sessionSecret.length < 16) {
-      throw new ConfigError('SESSION_SECRET must be at least 16 characters.')
-    }
   }
 
-  if (cfg.sessionSecret && cfg.sessionSecret.length < 16) {
-    throw new ConfigError('SESSION_SECRET must be at least 16 characters.')
+  // 3. The ONLY sanctioned way to run without credentials.
+  if (cfg.authDisabled) {
+    if (cfg.nodeEnv === 'production') {
+      throw new ConfigError('AUTH_DISABLED=true is not allowed in production.')
+    }
+    if (cfg.host !== '127.0.0.1' && cfg.host !== '::1') {
+      throw new ConfigError(
+        'AUTH_DISABLED=true is allowed only when HOST binds the loopback interface (127.0.0.1 or ::1). ' +
+          'Wildcard/network bindings must run with real credentials.'
+      )
+    }
+    return // explicit, loopback-only development mode
+  }
+
+  // 4. Fail closed: both credentials are required in EVERY environment.
+  const missing: string[] = []
+  if (!cfg.accessKey) {
+    missing.push('ACCESS_KEY')
+  } else if (cfg.accessKey.length < 16) {
+    throw new ConfigError('ACCESS_KEY must be at least 16 characters.')
+  }
+  if (!cfg.sessionSecret) {
+    missing.push('SESSION_SECRET')
+  } else if (Buffer.byteLength(cfg.sessionSecret, 'utf8') < 32) {
+    throw new ConfigError('SESSION_SECRET must be at least 32 UTF-8 bytes.')
+  }
+  if (missing.length > 0) {
+    const joined = missing.join(' and ')
+    throw new ConfigError(
+      `${joined} ${missing.length > 1 ? 'are' : 'is'} not set — authentication is required and must fail closed. ` +
+        `Configure both ACCESS_KEY and SESSION_SECRET before starting.`
+    )
   }
 }
 
