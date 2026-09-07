@@ -227,7 +227,7 @@ describe('ConcurrencyGate — independent waiters', () => {
     const full = gate.run('c', async () => 'x')
     await expect(full).rejects.toBeInstanceOf(QueueFullError)
     expect(gate.getMetrics().totalRejectedFull).toBe(1)
-    expect(full).rejects.toMatchObject({ retryAfterSeconds: expect.any(Number) })
+    await expect(full).rejects.toMatchObject({ retryAfterSeconds: expect.any(Number) })
 
     await expect(b).rejects.toBeInstanceOf(QueueTimeoutError)
     expect(gate.getMetrics().totalQueueTimeouts).toBe(1)
