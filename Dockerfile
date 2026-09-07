@@ -1,17 +1,32 @@
 # Use Node.js 20 slim as base
 FROM node:20-slim
 
-# Install yt-dlp and ffmpeg
+# Install system dependencies: Python for yt-dlp, ffmpeg, and Chromium for
+# PO-token generation (the bgutil provider runs headless Chromium to mint
+# Proof-of-Origin tokens that bypass YouTube's datacenter-IP bot-wall).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     ffmpeg \
     curl \
-    ca-certificates && \
-    pip3 install --no-cache-dir --break-system-packages yt-dlp && \
+    wget \
+    ca-certificates \
+    chromium \
+    chromium-driver \
+    fonts-liberation && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp and the bgutil PO-token provider PLUGIN (pip) so modern
+# yt-dlp (>= 2025.05.22) can fetch tokens automatically when a bgutil
+# provider server is reachable on port 4416 (or a script provider exists).
+# The provider server itself is NOT on npm: run it as a sidecar container
+# (see docker-compose.yml) or clone+build Brainicism/bgutil-ytdlp-pot-provider
+# and make its binary available on PATH — see POTOKEN.md.
+RUN pip3 install --no-cache-dir --break-system-packages \
+    yt-dlp \
+    bgutil-ytdlp-pot-provider
 
 # Set working directory
 WORKDIR /app

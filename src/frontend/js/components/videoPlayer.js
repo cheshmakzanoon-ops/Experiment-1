@@ -8,7 +8,12 @@
 
 import { $, el, showToast } from '../utils/domUtils.js';
 import { formatViewCount } from '../utils/persianUtils.js';
-import { getStreamUrl } from '../api.js';
+import { getStreamUrl, apiFetch } from '../api.js';
+import {
+    showQualitySelector,
+    getPreferredQuality,
+    qualityLabel
+} from './qualitySelector.js';
 import { shareVideo } from './videoCard.js';
 import {
     addToWatchHistory,
@@ -39,6 +44,59 @@ let currentVideoData = null;
 /** True while playing from a downloaded Blob (no probe / no stream URL). */
 let playingOffline = false;
 let offlineEventsBound = false;
+
+// --- stall detection state ---------------------------------------------------
+// The server closes upstream reads that stall >30s (streamProxy.ts); here we
+// additionally watch for client-side stalls (no playback progress for 15s)
+// and surface a friendly Persian error instead of infinite buffering.
+const STALL_CHECK_INTERVAL_MS = 5000;
+const STALL_TIMEOUT_MS = 15000;
+let stallTimerId = null;
+let lastProgressAt = 0;
+
+function stopStallDetection() {
+    if (stallTimerId) {
+        clearInterval(stallTimerId);
+        stallTimerId = null;
+    }
+}
+
+function showStreamError(msg) {
+    const notice = $('#streamNotice');
+    if (!notice) return;
+    notice.hidden = false;
+    notice.innerHTML =
+        '<span class="material-icons-round">play_circle_outline</span>' +
+        `<p>${msg}</p>`;
+}
+
+function checkForStall() {
+    const watchPage = $('#watchPage');
+    const videoPlayer = $('#videoPlayer');
+    // Only meaningful for live (online) playback on the visible watch page.
+    if (!watchPage || watchPage.style.display === 'none') return;
+    if (playingOffline || !videoPlayer) return;
+    if (videoPlayer.paused || videoPlayer.ended) return;
+
+    if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
+        console.warn('[player] Video stalled for 15s, showing error');
+        stopStallDetection();
+        videoPlayer.pause();
+        showStreamError('پخش ویدیو متوقف شده است. لطفاً دوباره تلاش کنید.');
+    }
+}
+
+function startStallDetection() {
+    stopStallDetection();
+    lastProgressAt = Date.now();
+    const videoPlayer = $('#videoPlayer');
+    if (videoPlayer) {
+        videoPlayer.ontimeupdate = () => {
+            lastProgressAt = Date.now();
+        };
+    }
+    stallTimerId = setInterval(checkForStall, STALL_CHECK_INTERVAL_MS);
+}
 
 /**
  * Open the watch page for a video-like object ({ id, title, ... }).
@@ -91,15 +149,12 @@ export async function openVideoPlayer(videoData, options = {}) {
     // --- action buttons (like / dislike / share / download) ---
     setupActionButtons(videoData);
 
-    const streamUrl = getStreamUrl(videoData.id);
+    // --- quality selector (144–480p) ---
+    setupQualityButton();
 
-    const showStreamError = (msg) => {
-        if (!notice) return;
-        notice.hidden = false;
-        notice.innerHTML =
-            '<span class="material-icons-round">play_circle_outline</span>' +
-            `<p>${msg}</p>`;
-    };
+    // Default to the user's preferred quality; the API key travels as a
+    // query param because <video> cannot send request headers.
+    const streamUrl = getStreamUrl(videoData.id, getPreferredQuality());
 
     if (!videoPlayer) return;
 
@@ -113,6 +168,7 @@ export async function openVideoPlayer(videoData, options = {}) {
     // Reset per-open state so a previously failed stream doesn't linger.
     videoPlayer.onplaying = () => {
         if (notice) notice.hidden = true;
+        lastProgressAt = Date.now();
     };
 
     // Play the local copy directly — no probe, no network needed.
@@ -130,7 +186,7 @@ export async function openVideoPlayer(videoData, options = {}) {
     // and shows a friendly Persian message instead.
     let playable = false;
     try {
-        const probe = await fetch(streamUrl, {
+        const probe = await apiFetch(streamUrl, {
             headers: { Range: 'bytes=0-0' }
         });
         playable = probe.status === 200 || probe.status === 206;
@@ -144,6 +200,7 @@ export async function openVideoPlayer(videoData, options = {}) {
         videoPlayer.play().catch((err) => {
             console.log('Autoplay prevented:', err);
         });
+        startStallDetection();
     } else {
         showStreamError('پخش این ویدیو در حال حاضر ممکن نیست. لطفاً کمی بعد دوباره تلاش کنید.');
     }
@@ -167,11 +224,51 @@ export function closeVideoPlayer() {
     if (notice) notice.hidden = true;
     currentVideoData = null;
     playingOffline = false;
+    stopStallDetection();
+    if (videoPlayer) videoPlayer.ontimeupdate = null;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Show the current preferred quality on the gear button label. */
+function updateQualityButtonLabel(button) {
+    if (!button) return;
+    const label = button.querySelector('span:last-child');
+    if (label) label.textContent = qualityLabel(getPreferredQuality());
+}
+
+/**
+ * Wire the watch-page quality button: opens the picker, saves the choice
+ * and reloads the current video at the new quality.
+ */
+function setupQualityButton() {
+    const qualityButton = $('#qualityButton');
+    const videoPlayer = $('#videoPlayer');
+    if (!qualityButton || !videoPlayer) return;
+
+    updateQualityButtonLabel(qualityButton);
+
+    qualityButton.onclick = () => {
+        if (!currentVideoData) return;
+        showQualitySelector(getPreferredQuality(), (newQuality) => {
+            updateQualityButtonLabel(qualityButton);
+            if (!currentVideoData) return;
+
+            playingOffline = false;
+            const notice = $('#streamNotice');
+            if (notice) notice.hidden = true;
+
+            const newStreamUrl = getStreamUrl(currentVideoData.id, newQuality);
+            videoPlayer.src = newStreamUrl;
+            videoPlayer.play().catch(() => {});
+
+            lastProgressAt = Date.now();
+            startStallDetection();
+        });
+    };
+}
 
 /** Best human text for the "when" part of the metadata row. */
 function uploadDateText(videoData) {

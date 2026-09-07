@@ -2,6 +2,8 @@
 // Recent searches live in localStorage (no account needed), and the
 // suggestion list combines them with common Persian queries.
 
+import { apiFetch } from '../api.js';
+
 const API_BASE = '/api';
 const RECENT_SEARCHES_KEY = 'recentSearches';
 const MAX_RECENT_SEARCHES = 10;
@@ -36,7 +38,7 @@ export const COMMON_SUGGESTIONS = [
  * @returns {Promise<{query: string, results: object[], total: number}>}
  */
 export async function performSearch(query) {
-    const response = await fetch(
+    const response = await apiFetch(
         `${API_BASE}/search?q=${encodeURIComponent(query)}&max=12`
     );
     if (!response.ok) {

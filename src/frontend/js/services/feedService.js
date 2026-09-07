@@ -2,6 +2,8 @@
 // category feeds, category list). The server proxies all YouTube traffic,
 // so these are the only calls the UI makes for trending content.
 
+import { apiFetch } from '../api.js';
+
 const API_BASE = '/api'
 
 /** Default category list shown while the server list is loading/offline. */
@@ -27,7 +29,7 @@ export const FALLBACK_CATEGORIES = [
  * @returns {Promise<{page: number, hasMore: boolean, videos: object[]}>}
  */
 export async function fetchHomeFeed(page = 1, limit = 12) {
-    const response = await fetch(`${API_BASE}/feed/home?page=${page}&limit=${limit}`);
+    const response = await apiFetch(`${API_BASE}/feed/home?page=${page}&limit=${limit}`);
     if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -41,7 +43,7 @@ export async function fetchHomeFeed(page = 1, limit = 12) {
  * @param {number} limit
  */
 export async function fetchCategoryFeed(categoryId, page = 1, limit = 12) {
-    const response = await fetch(
+    const response = await apiFetch(
         `${API_BASE}/feed/category/${encodeURIComponent(categoryId)}?page=${page}&limit=${limit}`
     );
     if (!response.ok) {
@@ -58,7 +60,7 @@ export async function fetchCategoryFeed(categoryId, page = 1, limit = 12) {
  */
 export async function fetchCategories() {
     try {
-        const response = await fetch(`${API_BASE}/feed/categories`);
+        const response = await apiFetch(`${API_BASE}/feed/categories`);
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }

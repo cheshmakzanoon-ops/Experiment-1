@@ -1,5 +1,6 @@
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { poTokenService } from '../services/potoken/generator.js'
 import type { SearchResult, VideoFormat, VideoMetadata } from '../types/video.js'
 
 const execFileAsync = promisify(execFile)
@@ -109,14 +110,15 @@ const PLAYER_CLIENTS: ReadonlyArray<string | undefined> = [undefined, 'android',
 
 /**
  * Build yt-dlp extractor-args for a player client, injecting a PO token
- * when the operator has one. PO tokens (Proof of Origin) help with the
- * bot-wall on datacenter IPs; generating them requires an external provider
- * (e.g. bgutil-ytdlp-pot-provider), so they are passed via env vars:
+ * when one is available. PO tokens (Proof of Origin) help get past the
+ * bot-wall on datacenter IPs. Tokens come from two places:
  *
- *   YT_PO_TOKEN       – the PO token value
- *   YT_VISITOR_DATA   – the visitorData value that pairs with the token
+ *   1. Env vars  YT_PO_TOKEN + YT_VISITOR_DATA  (manual override, or set
+ *      automatically by the PO-token service once it has generated a pair),
+ *   2. the auto-generation service (src/services/potoken/generator.ts),
+ *      which mints tokens through bgutil-ytdlp-pot-provider when installed.
  *
- * When unset, yt-dlp runs with its own client defaults.
+ * When neither is available, yt-dlp runs with its own client defaults.
  */
 function extractorArgsFor(client: string | undefined): string[] | undefined {
   if (client) {
@@ -125,13 +127,26 @@ function extractorArgsFor(client: string | undefined): string[] | undefined {
   return undefined
 }
 
-function poTokenArgs(): string[] | undefined {
+/**
+ * Resolve a `youtube:po_token=web+TOKEN+VISITOR_DATA` extractor arg, or
+ * undefined when no token is available. Falls back to the auto-generation
+ * service when the env pair is not set; any service failure simply means
+ * "extract without a token".
+ */
+async function poTokenExtractorArg(): Promise<string | undefined> {
   const token = process.env.YT_PO_TOKEN
   const visitorData = process.env.YT_VISITOR_DATA
   if (token && visitorData) {
-    return [`youtube:po_token=web+${token}+${visitorData}`]
+    return `youtube:po_token=web+${token}+${visitorData}`
   }
-  return undefined
+
+  try {
+    const tokenData = await poTokenService.getToken()
+    return `youtube:po_token=web+${tokenData.token}+${tokenData.visitorData}`
+  } catch {
+    // No token available — extraction still attempts without one.
+    return undefined
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,10 +351,13 @@ async function extractRawInfo(videoId: string): Promise<YtDlpVideoInfo> {
     if (extractorArgs) {
       args.splice(args.indexOf('--no-progress') + 1, 0, '--extractor-args', extractorArgs[0])
     } else {
-      // First attempt runs the default client pool; attach a PO token if set.
-      const poArgs = poTokenArgs()
+      // Default-client attempt: attach a PO token when one is available
+      // (env override first, then the auto-generation service). PO tokens
+      // are web-client-specific, so they are never attached to the
+      // android/mweb fallback attempts.
+      const poArgs = await poTokenExtractorArg()
       if (poArgs) {
-        args.splice(args.indexOf('--no-progress') + 1, 0, '--extractor-args', poArgs[0])
+        args.splice(args.indexOf('--no-progress') + 1, 0, '--extractor-args', poArgs)
       }
     }
 

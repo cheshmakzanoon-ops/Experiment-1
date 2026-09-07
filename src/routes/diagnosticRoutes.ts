@@ -6,6 +6,7 @@ import { isValidVideoId } from '../utils/urlValidator.js'
 import { streamCache } from '../middleware/streamCache.js'
 import { keepalive, bandwidthMonitor, assessSandboxHealth } from '../config/freebuff.js'
 import { detectBlocking, extractWithWorkarounds } from '../services/youtube/blockingWorkaround.js'
+import { poTokenService } from '../services/potoken/generator.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -24,6 +25,7 @@ const execFileAsync = promisify(execFile)
  *   GET /api/diag/sandbox           keepalive/bandwidth/health snapshot
  *   GET /api/diag/blocking-status   what type of YouTube block is active
  *   GET /api/diag/workaround-extract  run the workaround ladder for a video
+ *   GET /api/diag/potoken           PO-token provider status + token preview
  */
 
 const PROBE_VIDEO_ID = 'dQw4w9WgXcQ' // Rick Astley — essentially always available
@@ -440,6 +442,43 @@ diagnosticRoutes.get('/diag/stream-test', async (c) => {
   }
 })
 
+// --- GET /api/diag/potoken -----------------------------------------------------
+// PO-token status: env override, provider reachability, and (when a provider
+// answers) a freshly generated token pair preview.
+diagnosticRoutes.get('/diag/potoken', async (c) => {
+  const status = poTokenService.getStatus()
+
+  let tokenData: Record<string, string> | null = null
+  if (!status.hasToken || status.mode === 'provider') {
+    try {
+      const token = await poTokenService.getToken()
+      tokenData = {
+        tokenPreview: token.token.substring(0, 24) + '…',
+        visitorDataPreview: token.visitorData.substring(0, 24) + '…',
+        expiresInMinutes: String(Math.max(1, Math.round((token.expiresAt - Date.now()) / 60000)))
+      }
+    } catch (error: any) {
+      tokenData = {
+        error: error?.message || String(error),
+        hint: 'Run a bgutil POT provider (docker-compose.yml sidecar / clone Brainicism/bgutil-ytdlp-pot-provider; see POTOKEN.md), or set YT_PO_TOKEN / YT_VISITOR_DATA env vars'
+      }
+    }
+  }
+
+  return c.json({
+    timestamp: new Date().toISOString(),
+    status,
+    tokenData,
+    environmentCheck: {
+      ytPoTokenSet: !!process.env.YT_PO_TOKEN,
+      ytVisitorDataSet: !!process.env.YT_VISITOR_DATA,
+      providerUrl: process.env.YT_PO_PROVIDER_URL || 'http://127.0.0.1:4416',
+      note:
+        'PO tokens only matter when YouTube blocks datacenter IPs. Without a token, extraction still attempts (and may fail with a bot-wall).'
+    }
+  })
+})
+
 // --- GET /api/diag/sandbox ------------------------------------------------------
 // FreeBuff sandbox health snapshot.
 diagnosticRoutes.get('/diag/sandbox', (c) => {
@@ -473,7 +512,8 @@ diagnosticRoutes.get('/diag/blocking-status', async (c) => {
 })
 
 // --- GET /api/diag/workaround-extract ------------------------------------------------
-// Run the full workaround ladder (client rotation → WARP) against one video.
+// Run the workaround ladder (client rotation → explicit android/mweb) against
+// one video.
 diagnosticRoutes.get('/diag/workaround-extract', async (c) => {
   const videoId = c.req.query('v') || PROBE_VIDEO_ID
   if (!isValidVideoId(videoId)) {
@@ -545,9 +585,8 @@ diagnosticRoutes.get('/diag/report', async (c) => {
     isDatacenter,
     riskLevel: pipelineWorks ? 'low' : isDatacenter ? 'high' : 'medium',
     recommendation: pipelineWorks
-      ? 'System is working. Test from a phone, then build the APK and test from Iran.'
-      : isDatacenter
-        ? 'YouTube is likely blocking this datacenter IP. Try /api/diag/blocking-status, then consider a different egress (WARP / another host).'
+      ? 'System is working. Test from a phone, then build the APK and test from Iran.'        : isDatacenter
+          ? 'YouTube is likely blocking this datacenter IP. Try /api/diag/blocking-status and /api/diag/potoken (PO tokens help); if still blocked, move egress to another host with a residential/non-flagged IP.'
         : 'Extraction failed but the IP is not obviously a datacenter. Read /api/diag/ytdlp-verbose for the raw error.'
   }
 

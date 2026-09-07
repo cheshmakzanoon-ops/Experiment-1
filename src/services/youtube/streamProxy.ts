@@ -32,6 +32,64 @@ const UPSTREAM_HEADERS: Record<string, string> = {
 /** How long we wait for the upstream to send response headers. */
 const UPSTREAM_HEADER_TIMEOUT_MS = 30_000
 
+/** Maximum time between body chunks before declaring the upstream stalled. */
+const READ_TIMEOUT_MS = 30_000
+
+/**
+ * Wrap a ReadableStream with a read timeout: if no chunk arrives within
+ * `timeoutMs`, the stream errors out instead of hanging forever (YouTube's
+ * CDN can stall mid-stream on throttled/volatile links). Client disconnects
+ * cancel the upstream reader through the stream's cancel() hook.
+ */
+function withReadTimeout(
+  body: ReadableStream<Uint8Array>,
+  timeoutMs: number = READ_TIMEOUT_MS
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+
+  const armTimeout = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    timeoutId = setTimeout(() => {
+      controller.error(new Error(`Upstream stalled: no data for ${timeoutMs}ms`))
+      void reader.cancel().catch(() => {})
+    }, timeoutMs)
+    // Do not keep the process alive on a stalled stream.
+    timeoutId.unref?.()
+  }
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      armTimeout(controller)
+      try {
+        const { done, value } = await reader.read()
+        clearTimeout(timeoutId!)
+        timeoutId = null
+
+        if (done) {
+          controller.close()
+          return
+        }
+        if (value) {
+          controller.enqueue(value)
+        }
+      } catch (error) {
+        clearTimeout(timeoutId!)
+        timeoutId = null
+        controller.error(error)
+        void reader.cancel().catch(() => {})
+      }
+    },
+
+    cancel(reason) {
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+        timeoutId = null
+      }
+      return reader.cancel(reason)
+    }
+  })
+}
+
 /** Upstream statuses that suggest the cached URL was revoked/blocked. */
 function isBlockingStatus(status: number): boolean {
   return status === 403 || status === 429
@@ -185,7 +243,14 @@ function buildRelayResponse(
     return new Response(null, { status: upstream.status, headers })
   }
 
-  return new Response(upstream.body, { status: upstream.status, headers })
+  if (!upstream.body) {
+    return new Response(null, { status: upstream.status, headers })
+  }
+
+  // Wrap the body with a read timeout so a stalled upstream cannot leave the
+  // client buffering forever; disconnects still cancel the upstream reader.
+  const timeoutBody = withReadTimeout(upstream.body)
+  return new Response(timeoutBody, { status: upstream.status, headers })
 }
 
 /**

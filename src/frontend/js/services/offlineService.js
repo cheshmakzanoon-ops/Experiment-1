@@ -19,6 +19,8 @@
 // All functions are best-effort: storage failures reject so callers can
 // show a Persian toast; they never crash the app.
 
+import { appendKey, showApiKeyPrompt } from '../api.js';
+
 const DB_NAME = 'yt-offline-db';
 const DB_VERSION = 1;
 const VIDEOS_STORE = 'videos';
@@ -223,11 +225,18 @@ export async function startDownload(video) {
     let lastEventAt = 0;
 
     try {
-        const response = await fetch(`/api/stream/${encodeURIComponent(id)}?quality=${DOWNLOAD_QUALITY}`, {
+        // The stream proxy requires the API key; the <video> player gets it
+        // as a query param for the same reason (fetch headers would also
+        // work here, but the URL keeps both paths identical).
+        const streamUrl = appendKey(
+            `/api/stream/${encodeURIComponent(id)}?quality=${DOWNLOAD_QUALITY}`
+        );
+        const response = await fetch(streamUrl, {
             cache: 'no-store',
             signal: controller.signal
         });
         if (!response.ok || !response.body) {
+            if (response.status === 401) showApiKeyPrompt();
             throw new Error(`دانلود ممکن نشد (${response.status})`);
         }
 

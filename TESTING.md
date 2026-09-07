@@ -4,6 +4,12 @@ Everything below assumes the **server is running** (open the FreeBuff preview
 so the Node server is up) and uses `https://your-freebuff-url.app` as a
 stand-in for your real preview URL.
 
+> 🔑 **API key (Phase 7):** if `API_KEY` is configured, every request below
+> needs it — for `curl` add `-H "X-API-Key: YOUR_KEY"`, and when opening an
+> endpoint in a browser append `?key=YOUR_KEY`. Only `/api/health`,
+> `/api/health/ready`, `/api/config` and `/api/video/*/thumbnail` are public.
+> While `API_KEY` is unset the server logs a warning and runs open (dev mode).
+
 > ⚠️ **Test in this exact order.** Each step isolates a different component,
 > and the steps get progressively slower/riskier. Do **not** jump straight to
 > "play a video" — if it fails you will not know which layer broke.
@@ -29,12 +35,9 @@ stand-in for your real preview URL.
 
 ## Step 2 — Pipeline diagnostic (2–10 minutes, THE critical test)
 
-**What this tests:** the full yt-dlp → googlevideo.com → relay chain in one shot.
-
-Open in your browser (or `curl`):
-
+**What this tests:** the full yt-dlp → googlevideo.com → relay chain in one shot.Open in your browser (or `curl`):
 ```
-https://your-freebuff-url.app/api/diag/pipeline
+https://your-freebuff-url.app/api/diag/pipeline?key=YOUR_KEY
 ```
 
 **Expected:** JSON ending with
@@ -55,9 +58,10 @@ The response is a step-by-step trace. Read it like this:
 Find out what kind of block and what IP you are on:
 
 ```
-https://your-freebuff-url.app/api/diag/blocking-status
-https://your-freebuff-url.app/api/diag/ip
-https://your-freebuff-url.app/api/diag/ytdlp-verbose?v=dQw4w9WgXcQ
+https://your-freebuff-url.app/api/diag/blocking-status?key=YOUR_KEY
+https://your-freebuff-url.app/api/diag/ip?key=YOUR_KEY
+https://your-freebuff-url.app/api/diag/ytdlp-verbose?v=dQw4w9WgXcQ&key=YOUR_KEY
+https://your-freebuff-url.app/api/diag/potoken?key=YOUR_KEY
 ```
 
 - `blocking-status` names the block type and the workarounds available.
@@ -67,13 +71,13 @@ https://your-freebuff-url.app/api/diag/ytdlp-verbose?v=dQw4w9WgXcQ
   "Sign in to confirm you're not a bot", HTTP 429/403).
 
 **Workarounds to try, in order:**
-1. `/api/diag/workaround-extract?v=dQw4w9WgXcQ&quality=240` — runs the
-   workaround ladder (player-client rotation again, then Cloudflare WARP if
-   `warp-cli` is installed in the container). If it reports success with WARP,
-   YouTube blocking is IP-based and egress is the fix.
-2. Re-run `/api/diag/pipeline` after a few minutes (rate limits often expire).
-3. Add a **PO token pair** (`YT_PO_TOKEN` + `YT_VISITOR_DATA`) via the
-   FreeBuff env/keys UI — extraction already passes them to yt-dlp when set.
+1. `/api/diag/workaround-extract?v=dQw4w9WgXcQ&quality=240&key=YOUR_KEY` —
+   runs the workaround ladder (client rotation → explicit android/mweb).
+2. Check `/api/diag/potoken` — since Phase 7 the app auto-generates PO
+   tokens when the bgutil provider is installed (see POTOKEN.md); otherwise
+   set a **manual token pair** (`YT_PO_TOKEN` + `YT_VISITOR_DATA`) via the
+   FreeBuff env/keys UI.
+3. Re-run `/api/diag/pipeline` after a few minutes (rate limits often expire).
 4. If all of that fails you are IP-blocked for real → **Plan B** at the bottom.
 
 ---
@@ -174,6 +178,7 @@ Full build/signing notes: `android/README.md`.
 | `/api/diag/stream-test` | round-trip through our own `/api/stream` |
 | `/api/diag/blocking-status` | which YouTube block type is active |
 | `/api/diag/workaround-extract` | run the workaround ladder for one video |
+| `/api/diag/potoken` | PO-token provider status + token preview |
 | `/api/diag/report` | everything above combined into one verdict |
 | `/api/diag/sandbox` | keepalive / bandwidth / sandbox health |
 | `/api/health` | basic liveness |

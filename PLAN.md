@@ -126,10 +126,13 @@ wrapper (`android/`, Phase 5) turns the web app into an installable app.
   `/api/diag/blocking-status` + `/api/diag/workaround-extract` (run the
   workaround ladder over HTTP).
 - **Blocking workarounds** (`src/services/youtube/blockingWorkaround.ts`):
-  block-type detection (bot-wall / rate-limit / IP-block), Cloudflare WARP
-  hop when `warp-cli` is installed, and an explicit
-  default → android → mweb → WARP extraction ladder (normal extraction
-  already rotates clients internally; this is the fallback on top).
+  block-type detection (bot-wall / rate-limit / IP-block) and an explicit
+  default → android → mweb extraction ladder (normal extraction already
+  rotates clients internally; this is the fallback on top). Cloudflare WARP
+  was removed in Phase 7 — the image does not install `warp-cli`.
+- **PO token support** (`src/services/potoken/generator.ts`): boot-time
+  auto-generation + 4-hour refresh via the bgutil provider when installed
+  (see Phase 7).
 - **FreeBuff sandbox support** (`src/config/freebuff.ts`): keepalive that
   self-pings `/api/health` every 4 min (started in `src/index.ts`),
   bandwidth monitor + slow-request logging middleware, and
@@ -145,33 +148,87 @@ YouTube from a live deployment.** Running `TESTING.md` Step 2
 (`/api/diag/pipeline`) against the preview is the next gate — it decides
 whether to proceed with the APK + Iran rollout or pivot to Plan B.
 
+## Status — Phase 7 (security hardening & production fixes) ✅ implemented
+
+- **API-key authentication** (`src/middleware/auth.ts`): every `/api/*`
+  request needs `API_KEY` (query param, `X-API-Key`, or `Bearer` header),
+  compared in constant time. Public only: `/api/health`, `/api/health/ready`,
+  `/api/config` (frontend bootstrap) and `/api/video/:id/thumbnail`
+  (`<img>` tags cannot send headers). Unset `API_KEY` = warned, insecure
+  dev mode. Frontend (`js/api.js` + services) sends the key automatically,
+  streams get it in the URL, and unauthorized requests show a Persian key
+  prompt (`/api/config` auto-provisions the key when configured).
+- **PO token setup** (`src/services/potoken/generator.ts` + POTOKEN.md):
+  boot-time spawn of the bgutil HTTP provider, auto-generated token pair
+  refreshed every 4 h into `YT_PO_TOKEN`/`YT_VISITOR_DATA` (legacy
+  extractor-arg path), plus the yt-dlp plugin path for modern yt-dlp.
+  Graceful: no provider → warn and extract without a token.
+  `/api/diag/potoken` reports mode/status/token preview.
+- **WARP dead code removed** (`blockingWorkaround.ts`): Cloudflare WARP was
+  unreachable (image has no `warp-cli`); ladder is now
+  default rotation → android → mweb, with a comment on re-enabling WARP.
+- **Accurate stream bandwidth** (`src/middleware/streamByteCounter.ts`):
+  `/api/stream/*` bodies are wrapped and counted as bytes actually flow
+  (chunked relays + early disconnects included); generic middleware counts
+  Content-Length responses; `/api/diag/sandbox` now reports MB + GB.
+- **Keepalive external ping** (`src/config/freebuff.ts`): pings both
+  `/api/health` (loopback) and an external host (default api.ipify.org,
+  override `KEEPALIVE_EXTERNAL_URL`) so idle detection that measures egress
+  traffic sees real activity. Status incl. per-ping counters in
+  `/api/diag/sandbox`. README documents UptimeRobot/cron-job.org
+  alternatives for hosts where self-pings do not count.
+- **Stream read timeout** (`streamProxy.ts`): relayed bodies error out after
+  30 s without a chunk (no more infinite buffering); client disconnect
+  still cancels upstream reads. Frontend adds a 15 s stall detector with a
+  Persian error message.
+- **Quality selector UI** (`js/components/qualitySelector.js` + watch-page
+  gear button): 144/240(recommended)/360/480p, preference stored in
+  localStorage, video reloads at the chosen quality.
+- **Diagnostic endpoints protected** — all `/api/diag/*` are behind auth;
+  only health/config/thumbnails are public (see the Security section in
+  README.md).
+
+### Next steps
+- [ ] Run the pipeline test from a live deployment (TESTING.md) — Canada first
+- [ ] Test from Iran on the real household links
+- [ ] Build the APK against the production URL (`./build-apk.sh …`) and
+      install on the parents' phones
+- [ ] Configure `API_KEY` in production env; decide PO-token strategy
+      (auto-provider vs manual env pair) after the first live bot-wall test
+
 ## Remaining work (next phases)
 
-1. **Run Phase 6 live:** execute `TESTING.md` steps against the deployed
+1. **Run Phase 6/7 live:** execute `TESTING.md` steps against the deployed
    preview; record `/api/diag/pipeline` + `/api/diag/ip` results. If the
-   sandbox IP is blocked, move the backend to Plan B egress and re-test.
+   sandbox IP is blocked, add a PO token (POTOKEN.md) or move the backend to
+   Plan B egress and re-test.
 2. **Optional:** subscriptions with real upload feeds need a backend (or
    YouTube channel scraping) instead of local-only storage.
-2. **Optional:** chunked IndexedDB writes for very large offline files
+3. **Optional:** chunked IndexedDB writes for very large offline files
    (currently a finished download is assembled as one Blob before being
    stored).
-3. **Optional:** real-device Android checklist (install the debug APK,
+4. **Optional:** real-device Android checklist (install the debug APK,
    verify back/offline/share/downloads on the target phone) — the wrapper
    code builds from Gradle but hasn't been run on hardware yet.
 
 ### Streaming-phase follow-ups (only if playback proves unreliable)
 
-- PO tokens: wire a real provider (bgutil-ytdlp-pot-provider) and feed the
-  token through `YT_PO_TOKEN`/`YT_VISITOR_DATA` instead of manual env.
-- Residential egress / authenticated cookies when datacenter IPs stay blocked.
+- Residential egress / authenticated cookies when datacenter IPs stay blocked
+  (PO tokens alone do not guarantee a bypass).
 - Redis-backed stream cache if the server ever runs multi-instance.
 
-### Notes on the Phase 6 keepalive
+### Notes on the keepalive
 
 The keepalive only matters on hosts that idle-suspend (FreeBuff dev
-sandboxes). On a real always-on VPS (Plan B) it is a harmless 4-minute
-self-ping; disable it there if you dislike the log noise (remove
-`keepalive.start(4)` in `src/index.ts`).
+sandboxes); it now pings both loopback `/api/health` and an external host.
+On a real always-on VPS (Plan B) it is harmless — disable it there if you
+dislike the log noise (remove `keepalive.start(4)` in `src/index.ts`). If
+self-pings (even external ones) do not keep a given sandbox awake, use an
+outside monitor instead:
+
+- **UptimeRobot** (free tier): HTTP monitor on
+  `https://your-freebuff-url.app/api/health`, 5-minute interval.
+- **cron-job.org** (free): cron job every 5 minutes hitting the same URL.
 
 ## Notes / guardrails
 

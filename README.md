@@ -82,11 +82,12 @@ installed.
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /api/health` | liveness + memory |
-| `GET /api/health/ready` | readiness incl. yt-dlp check |
+| `GET /api/health` | liveness + memory (**public**) |
+| `GET /api/health/ready` | readiness incl. yt-dlp check (**public**) |
+| `GET /api/config` | bootstrap config — hands the frontend its API key (**public**) |
 | `GET /api/search?q=...&max=8` | search results (yt-dlp `ytsearch`) |
 | `GET /api/video/:id?quality=240` | video metadata (cached 2 h) |
-| `GET /api/video/:id/thumbnail` | proxied thumbnail (i.ytimg.com relay) |
+| `GET /api/video/:id/thumbnail` | proxied thumbnail (i.ytimg.com relay; **public** — `<img>` tags can't send a key header) |
 | `GET /api/stream/:id?quality=240` | **byte-relayed video stream** (Range/206, HEAD) |
 | `GET /api/stream/:id/probe` | lightweight availability check |
 | `GET /api/stream/stats` | stream-cache statistics |
@@ -100,6 +101,7 @@ installed.
 | `GET /api/diag/stream-test` | round-trip through `/api/stream` |
 | `GET /api/diag/blocking-status` | active YouTube block type |
 | `GET /api/diag/workaround-extract` | workaround ladder for one video |
+| `GET /api/diag/potoken` | PO-token provider status + token preview |
 | `GET /api/diag/report` | combined diagnostic report + verdict |
 | `GET /api/diag/sandbox` | keepalive / bandwidth / sandbox health |
 
@@ -118,8 +120,53 @@ requests pass through → `206 Partial Content`), direct URLs are cached for
 2 hours and never exposed to clients, and a blocked/expired URL triggers one
 cache-invalidating re-extraction before failing.
 
-The server also self-pings `/api/health` every 4 minutes (keepalive) and
-tracks bandwidth/slow requests; snapshot them at `/api/diag/sandbox`.
+The server also runs a keepalive every 4 minutes — an internal `/api/health`
+self-ping **and** an external ping (`api.ipify.org`, overridable with
+`KEEPALIVE_EXTERNAL_URL`) that generates real egress traffic so idle
+FreeBuff-style sandboxes stay awake — and tracks bandwidth/slow requests;
+snapshot them at `/api/diag/sandbox`. See “Security” below and the keepalive
+alternatives in `PLAN.md` for always-on VPS deployments.
+
+## Security
+
+### API key authentication
+
+Every `/api/*` endpoint except the small public set (liveness/readiness,
+`/api/config`, and proxied thumbnails) requires an API key. Set it via
+environment variable:
+
+```bash
+export API_KEY=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+```
+
+The key may be sent as `X-API-Key: <key>`, `Authorization: Bearer <key>`, or
+`?key=<key>` (the `<video>` element uses the query param). The frontend
+fetches the key from `/api/config` on first load or shows a Persian prompt
+when a request is unauthorized — no manual header configuration needed.
+
+- **Without `API_KEY` set the server warns once and runs in insecure dev
+  mode** (auth disabled) so local/preview work is frictionless. Set the key
+  in the platform env UI before serving real users.
+- **Protected:** video proxy (`/api/stream`), search/feed/video metadata,
+  and **all `/api/diag/*` endpoints** — these expose server infrastructure
+  details (IP, hosting provider, bandwidth, PO-token state) and must never
+  be reachable without a key.
+- **Public by design:** `/api/health`, `/api/health/ready`, `/api/config`
+  (frontend bootstrap), and `/api/video/:id/thumbnail` (rendered by `<img>`
+  tags, which cannot send headers).
+
+### PO token
+
+For datacenter-IP deployments, PO tokens are often the difference between
+extraction working and `Sign in to confirm you're not a bot`. The image
+includes the bgutil provider + plugin and the app auto-generates/refreshes
+tokens; see **[POTOKEN.md](POTOKEN.md)** for setup and troubleshooting.
+
+### Quality selector
+
+The watch page gear button lets viewers pick 144p / 240p (recommended) /
+360p / 480p; the choice is remembered per device and the video reloads at
+the new quality immediately.
 
 ### Live testing & failure diagnosis
 
@@ -127,9 +174,12 @@ Before trusting this in front of the family, validate the deployment against
 real YouTube: follow **`TESTING.md`** top to bottom. The `/api/diag/*`
 endpoints (see the API table) isolate exactly where the pipeline breaks —
 extraction blocked (bot-wall/429/403), video-CDN blocked, or network — and
-`/api/diag/workaround-extract` runs the client-rotation/WARP fallback ladder
-(`src/services/youtube/blockingWorkaround.ts`). Expect YouTube to block plain
-datacenter IPs; that is the #1 known failure mode for FreeBuff-style hosting.
+`/api/diag/workaround-extract` runs the fallback ladder — client rotation
+→ explicit android/mweb attempts (`src/services/youtube/blockingWorkaround.ts`;
+Cloudflare WARP was removed because the image does not install `warp-cli`).
+Expect YouTube to block plain datacenter IPs; that is the #1 known failure
+mode for FreeBuff-style hosting — see POTOKEN.md before falling back to
+Plan B egress.
 
 `quality` is a *maximum*: the extractor picks the highest combined
 (audio+video) MP4/WebM ≤ that height, or the smallest one above it when
@@ -145,6 +195,11 @@ Valid values: `144`, `240`, `360`, `480`.
 # Server Configuration
 PORT=3000
 NODE_ENV=production
+
+# Critical Security — generate with:
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# Unset = insecure dev mode (auth disabled + startup warning).
+API_KEY=
 
 # Cache Settings
 CACHE_TTL_VIDEO=7200000
@@ -166,11 +221,16 @@ LOG_LEVEL=info
 # CORS
 CORS_ORIGIN=*
 
-# Optional — PO token (Proof of Origin) pair to bypass YouTube's
-# datacenter-IP bot-wall. Generate both with a PO-token provider and paste
-# them into the platform env UI.
+# PO tokens (Proof of Origin) to bypass YouTube's datacenter-IP bot-wall.
+# Preferred: leave empty — the bgutil provider auto-generates (POTOKEN.md).
+# Manual override pair:
 YT_PO_TOKEN=
 YT_VISITOR_DATA=
+# bgutil HTTP provider URL (auto-spawned at 127.0.0.1:4416 when default).
+YT_PO_PROVIDER_URL=http://127.0.0.1:4416
+
+# Keepalive external ping target (egress traffic for idle sandboxes).
+KEEPALIVE_EXTERNAL_URL=https://api.ipify.org
 ```
 
 `.env.example` cannot be committed in this workspace; the platform env UI

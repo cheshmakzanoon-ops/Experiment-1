@@ -16,14 +16,18 @@ const execFileAsync = promisify(execFile)
  * YouTube aggressively blocks datacenter IPs ("Sign in to confirm you're
  * not a bot", HTTP 429/403). Normal extraction in src/utils/ytDlp.ts already
  * retries with exponential backoff and rotates player clients
- * (default → android → mweb). This module layers diagnostics and fallbacks
- * on top of that:
+ * (default → android → mweb). This module layers diagnostics and a fallback
+ * ladder on top of that:
  *
  *   - detectBlocking()      — classify the exact block type YouTube applies,
- *   - tryCloudflareWarp()   — hop out through Cloudflare WARP when the CLI is
- *     installed (changes the apparent egress IP),
- *   - extractWithWorkarounds() — drive extraction through the full ladder of
- *     workarounds and report which one (if any) got through.
+ *   - extractWithWorkarounds() — drive extraction through the ladder and
+ *     report which attempt (if any) got through.
+ *
+ * Cloudflare WARP was previously a ladder rung but was removed: the Docker
+ * image does not install `warp-cli` (the image is already large with
+ * Chromium), so that path could never succeed. To re-enable it later,
+ * install cloudflare-warp in the Dockerfile and restore a
+ * `warp-cli connect` → re-extract step here.
  */
 
 export interface BlockingTestResult {
@@ -74,8 +78,7 @@ export async function detectBlocking(): Promise<BlockingTestResult> {
         blockType: 'bot_detection',
         workaroundsAvailable: [
           'player_client_rotation (built into ytDlp.ts)',
-          'po_token (YT_PO_TOKEN / YT_VISITOR_DATA env)',
-          'cloudflare_warp (changes egress IP)',
+          'po_token (auto-generated or YT_PO_TOKEN / YT_VISITOR_DATA env)',
           'residential egress / authenticated cookies'
         ]
       }
@@ -98,7 +101,7 @@ export async function detectBlocking(): Promise<BlockingTestResult> {
         isBlocked: true,
         blockType: 'ip_block',
         workaroundsAvailable: [
-          'cloudflare_warp (changes egress IP)',
+          'po_token (see POTOKEN.md)',
           'different hosting provider / residential egress'
         ]
       }
@@ -110,47 +113,6 @@ export async function detectBlocking(): Promise<BlockingTestResult> {
       workaroundsAvailable: ['unknown — check /api/diag/ytdlp-verbose for the raw error'],
       detail: error instanceof Error ? error.message : String(error)
     }
-  }
-}
-
-/**
- * Try Cloudflare WARP if the CLI is installed. This changes our apparent
- * egress IP to a Cloudflare IP, which YouTube does not block as aggressively
- * as plain datacenter ranges.
- */
-export async function tryCloudflareWarp(): Promise<{
-  success: boolean
-  newIp?: string
-  error?: string
-}> {
-  try {
-    // Check the CLI exists first.
-    await execFileAsync('warp-cli', ['--version'], { timeout: 5000 })
-  } catch (error) {
-    return { success: false, error: `warp-cli not available: ${error instanceof Error ? error.message : error}` }
-  }
-
-  try {
-    // Connect (idempotent — already-connected is fine) and wait to settle.
-    await execFileAsync('warp-cli', ['connect'], { timeout: 15000 })
-    await new Promise((resolve) => setTimeout(resolve, 3000))
-
-    const { stdout } = await execFileAsync('warp-cli', ['status'], { timeout: 5000 })
-    if (!/connected/i.test(String(stdout))) {
-      return { success: false, error: `WARP not connected (status: ${String(stdout).trim().slice(0, 200)})` }
-    }
-
-    const ipResponse = await fetch('https://api.ipify.org?format=json', {
-      signal: AbortSignal.timeout(10000)
-    })
-    if (!ipResponse.ok) {
-      return { success: false, error: `WARP connected but ipify returned ${ipResponse.status}` }
-    }
-    const data = (await ipResponse.json()) as { ip?: string }
-
-    return { success: true, newIp: data.ip }
-  } catch (error) {
-    return { success: false, error: `WARP failed: ${error instanceof Error ? error.message : error}` }
   }
 }
 
@@ -230,10 +192,13 @@ export interface WorkaroundExtractionResult {
 /**
  * Enhanced extraction with automatic workaround attempts:
  *
- *   1. normal extraction (itself: default → android → mweb rotation),
+ *   1. normal extraction (itself: default → android → mweb rotation with
+ *      backoff and an optional PO token),
  *   2. explicit android player client,
- *   3. explicit mweb player client,
- *   4. Cloudflare WARP, then a fresh normal extraction.
+ *   3. explicit mweb player client.
+ *
+ * (Cloudflare WARP was rung 4 until it was removed — warp-cli is not
+ * installed in the Docker image. See the module docstring for re-enabling.)
  *
  * Content-level failures (private/age-gated/404/geo/DRM) are never retried —
  * a client switch cannot fix those, so they fail fast.
@@ -268,25 +233,16 @@ export async function extractWithWorkarounds(
     }
   }
 
-  // 4. Cloudflare WARP (only if installed) + one more normal attempt.
-  const warp = await tryCloudflareWarp()
-  if (warp.success) {
-    workaroundsAttempted.push(`cloudflare_warp (egress ${warp.newIp || 'changed'})`)
-    try {
-      const info = await extractVideoInfo(videoId, maxHeight)
-      return { success: true, data: info, workaroundsAttempted }
-    } catch (error) {
-      workaroundsAttempted.push(
-        `re-extraction after WARP (failed: ${error instanceof Error ? error.message.slice(0, 120) : 'error'})`
-      )
-    }
-  } else if (warp.error) {
-    console.log(`[blocking] WARP skipped: ${warp.error}`)
-  }
+  // 4. Cloudflare WARP — REMOVED. The Docker image does not install
+  //    `warp-cli`, so hopping egress through WARP could never work here.
+  //    If it is ever needed again: add cloudflare-warp to the Dockerfile,
+  //    then reconnect + re-extract in this slot (see the module docstring).
 
   return {
     success: false,
     workaroundsAttempted,
-    error: 'All extraction workarounds failed. YouTube is blocking this server IP.'
+    error:
+      'All extraction methods failed. YouTube is blocking this server IP.\n' +
+      'Recommended: ensure a PO token is configured (see POTOKEN.md) or move egress to a residential IP.'
   }
 }
