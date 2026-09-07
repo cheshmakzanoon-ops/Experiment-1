@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">ویدیو</string>
+    <string name="loading">در حال بارگذاری…</string>
+    <string name="error_no_internet">اینترنت قطع است</string>
+    <string name="retry">تلاش مجدد</string>
+    <string name="exit_title">خروج از برنامه</string>
+    <string name="exit_message">آیا می‌خواهید از برنامه خارج شوید؟</string>
+    <string name="yes">بله</string>
+    <string name="no">خیر</string>
+    <string name="ok">باشه</string>
+    <string name="share_title">اشتراک‌گذاری</string>
+    <string name="download_saved">ویدیو در پوشه Movies ذخیره شد</string>
+    <string name="download_failed">دانلود انجام نشد</string>
+</resources>

@@ -1,0 +1,96 @@
+/* RTL Specific Styles */
+
+/* Force RTL direction on body */
+body {
+    direction: rtl;
+}
+
+/* Fix for numbers and dates in RTL context */
+.numbers,
+.time,
+.date,
+.duration {
+    direction: ltr;
+    unicode-bidi: embed;
+    display: inline-block;
+}
+
+/* Search suggestions in RTL */
+.suggestion-text {
+    text-align: right;
+}
+
+/* Video card content in RTL */
+.video-card__content {
+    direction: rtl;
+}
+
+/* Fix for icons that need to be mirrored in RTL */
+/* Back arrow should point right in RTL */
+#searchBackButton .material-icons-round {
+    transform: scaleX(-1);
+}
+
+/* Video close button positioning in RTL */
+.video-close-button {
+    right: var(--spacing-sm);
+    left: auto;
+}
+
+/* Duration badge positioning in RTL */
+.video-card__duration,
+.video-card__live-badge {
+    left: var(--spacing-sm);
+    right: auto;
+}
+
+/* More options menu in RTL */
+.video-card__menu {
+    margin-left: 0;
+    margin-right: auto;
+}
+
+/* Fix for horizontal scrolling in RTL */
+.filter-chips {
+    direction: rtl;
+}
+
+/* Bottom navigation items order in RTL */
+.bottom-navigation {
+    direction: rtl;
+}
+
+.nav-item:first-child {
+    order: 1; /* Home on right */
+}
+
+.nav-item:nth-child(2) {
+    order: 2; /* Shorts */
+}
+
+.nav-item:nth-child(3) {
+    order: 3; /* Create */
+}
+
+.nav-item:nth-child(4) {
+    order: 4; /* Subscriptions */
+}
+
+.nav-item:last-child {
+    order: 5; /* Library on left */
+}
+
+/* Persian font adjustments */
+body {
+    letter-spacing: 0;
+}
+
+/* Fix for mixed RTL/LTR text */
+.mixed-content {
+    unicode-bidi: plaintext;
+}
+
+/* Adjust for Persian numerals */
+.persian-numbers {
+    font-feature-settings: "ss01";
+}

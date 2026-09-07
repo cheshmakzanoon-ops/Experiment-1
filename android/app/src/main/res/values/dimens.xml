@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Height of the thin page-load progress line over the WebView. -->
+    <dimen name="progress_bar_height">3dp</dimen>
+    <dimen name="page_padding">12dp</dimen>
+</resources>

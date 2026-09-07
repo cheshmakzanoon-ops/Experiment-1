@@ -1,0 +1,86 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// Web app URL baked into BuildConfig.WEBAPP_URL at build time.
+//
+// Priority: -PWEBAPP_URL="https://..." on the command line → the WEBAPP_URL
+// property in gradle.properties → this default. Point it at the public,
+// always-on deployment of the web app (NOT a throwaway dev preview) before
+// building the APK you hand to family.
+def webappUrl = (project.findProperty('WEBAPP_URL') ?: 'http://localhost:3000').toString()
+
+android {
+    namespace 'com.familytube'
+    compileSdk 34
+
+    // Optional release signing. When the STORE_FILE gradle property is set
+    // the release APK is signed and installable directly; otherwise release
+    // builds produce an unsigned APK (see android/README.md — debug builds
+    // are auto-signed and install as-is).
+    signingConfigs {
+        release {
+            def storeFileProp = project.findProperty('STORE_FILE')
+            if (storeFileProp) {
+                storeFile file(storeFileProp)
+                storePassword project.findProperty('STORE_PASSWORD')
+                keyAlias project.findProperty('KEY_ALIAS')
+                keyPassword project.findProperty('KEY_PASSWORD')
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.familytube"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+
+        buildConfigField "String", "WEBAPP_URL", "\"${webappUrl}\""
+
+        // We are far below the method limit, but multidex costs nothing and
+        // protects against surprises on very old low-end devices.
+        multiDexEnabled true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+
+            def storeFileProp = project.findProperty('STORE_FILE')
+            if (storeFileProp) {
+                signingConfig signingConfigs.release
+            }
+        }
+
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        buildConfig true
+        viewBinding true
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.webkit:webkit:1.9.0'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+}

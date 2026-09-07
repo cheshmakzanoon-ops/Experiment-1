@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0F0F0F">
+    <meta name="description" content="یوتیوب - تماشای ویدیو">
+    <title>یوتیوب</title>
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&display=swap" rel="stylesheet">
+    
+    <!-- Styles -->
+    <link rel="stylesheet" href="styles/main.css">
+    <link rel="stylesheet" href="styles/youtube-theme.css">
+    <link rel="stylesheet" href="styles/components.css">
+    <link rel="stylesheet" href="styles/rtl.css">
+    
+    <!-- Icons (Material Icons for YouTube-like icons) -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Round">
+</head>
+<body>
+    <!-- Top App Bar -->
+    <header class="top-app-bar" id="topAppBar">
+        <div class="top-app-bar__row">
+            <!-- YouTube Logo (right in RTL) -->
+            <div class="top-app-bar__section top-app-bar__section--start">
+                <button class="icon-button" id="menuButton" aria-label="منو">
+                    <span class="material-icons-round">menu</span>
+                </button>
+                <div class="youtube-logo">
+                    <svg width="90" height="20" viewBox="0 0 90 20" fill="none">
+                        <path d="M27.9727 3.12324C27.6435 1.89323 26.6768 0.926623 25.4468 0.597366C23.2197 2.24288e-07 14.2827 0 14.2827 0C14.2827 0 5.34568 2.24288e-07 3.11857 0.597366C1.88856 0.926623 0.921947 1.89323 0.59269 3.12324C-2.24288e-07 5.35035 0 10 0 10C0 10 -2.24288e-07 14.6497 0.59269 16.8768C0.921947 18.1068 1.88856 19.0734 3.11857 19.4026C5.34568 20 14.2827 20 14.2827 20C14.2827 20 23.2197 20 25.4468 19.4026C26.6768 19.0734 27.6435 18.1068 27.9727 16.8768C28.5654 14.6497 28.5654 10 28.5654 10C28.5654 10 28.5654 5.35035 27.9727 3.12324Z" fill="#FF0000"/>
+                        <path d="M11.4253 14.2854L18.8477 10.0004L11.4253 5.71533V14.2854Z" fill="white"/>
+                        <path d="M34.6024 13.0036L31.3945 1.41846H34.1932C34.1932 1.41846 35.4029 6.87265 35.7158 8.74622H35.7971C35.8827 8.09072 36.1141 6.87265 36.4658 5.12476L36.7235 1.41846H39.4859L36.2381 13.0036V19.0057H33.4737V13.0036H34.6024Z" fill="#FFFFFF"/>
+                        <path d="M41.6317 18.8064C41.0011 18.4218 40.5555 17.8249 40.3014 17.0157C40.0433 16.2104 39.9157 15.1314 39.9157 13.7821V12.1892C39.9157 10.8318 40.0585 9.74461 40.3415 8.92224C40.6245 8.10381 41.0654 7.50139 41.6659 7.12385C42.2626 6.74915 43.0255 6.56262 43.9493 6.56262C44.8615 6.56262 45.6126 6.75278 46.1983 7.13464C46.7839 7.51333 47.214 8.12007 47.4862 8.94465C47.7585 9.76903 47.8957 10.8559 47.8957 12.2024V13.8005C47.8957 15.1436 47.762 16.2201 47.4934 17.0319C47.2248 17.8438 46.7947 18.4382 46.2036 18.8101C45.6125 19.182 44.8423 19.3683 43.8927 19.3683C42.9239 19.3683 42.1557 19.182 41.6317 18.8064ZM45.0735 16.7256C45.236 16.3092 45.3172 15.662 45.3172 14.7876V11.4718C45.3172 10.6133 45.2325 9.97326 45.0637 9.55683C44.8948 9.1404 44.6135 8.93337 44.2197 8.93337C43.8387 8.93337 43.5652 9.1404 43.3992 9.55683C43.2366 9.97326 43.155 10.6133 43.155 11.4718V14.7876C43.155 15.662 43.2335 16.3092 43.3928 16.7256C43.5516 17.1457 43.8269 17.3572 44.2197 17.3572C44.6131 17.3572 44.8944 17.1457 45.0735 16.7256Z" fill="#FFFFFF"/>
+                    </svg>
+                    <span class="youtube-logo__country">IR</span>
+                </div>
+            </div>
+            
+            <!-- Action Icons (left in RTL) -->
+            <div class="top-app-bar__section top-app-bar__section--end">
+                <button class="icon-button" id="searchButton" aria-label="جستجو">
+                    <span class="material-icons-round">search</span>
+                </button>
+                <button class="icon-button" aria-label="اعلان‌ها">
+                    <span class="material-icons-round">notifications</span>
+                    <span class="badge">3</span>
+                </button>
+                <div class="profile-avatar">
+                    <img src="assets/default-avatar.svg" alt="پروفایل">
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Search Bar (hidden by default, shows when search button clicked) -->
+    <div class="search-bar-container" id="searchBarContainer" style="display: none;">
+        <div class="search-bar">
+            <button class="icon-button" id="searchBackButton" aria-label="بازگشت">
+                <span class="material-icons-round">arrow_forward</span>
+            </button>
+            <input type="text" id="searchInput" placeholder="جستجو..." autocomplete="off">
+            <button class="icon-button" id="voiceSearchButton" aria-label="جستجوی صوتی">
+                <span class="material-icons-round">mic</span>
+            </button>
+        </div>
+        <div class="search-suggestions" id="searchSuggestions"></div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="main-content" id="mainContent">
+        <!-- Filter Chips (rendered by js/components/homeFeed.js: seeded
+             instantly from the built-in category list so they work even
+             offline, then refreshed from /api/feed/categories). -->
+        <div class="filter-chips" id="filterChips"></div>
+
+        <!-- Home Feed -->
+        <div class="video-feed" id="videoFeed">
+            <!-- Video cards will be dynamically added here -->
+            <div class="loading-spinner">
+                <div class="spinner"></div>
+                <p>در حال بارگذاری...</p>
+            </div>
+        </div>
+    </main>
+
+    <!-- Video Player Page (hidden by default) -->
+    <div class="watch-page" id="watchPage" style="display: none;">
+        <div class="video-player-container">
+            <video id="videoPlayer" controls preload="metadata"></video>
+            <button class="video-close-button" id="videoCloseButton">
+                <span class="material-icons-round">close</span>
+            </button>
+        </div>
+        <!-- Shown when the /api/stream proxy is not ready yet (phase 2) -->
+        <div class="stream-notice" id="streamNotice" hidden></div>
+        <div class="video-details">
+            <h1 class="video-title" id="videoTitle"></h1>
+            <div class="video-metadata">
+                <span id="videoViewCount"></span>
+                <span class="dot">•</span>
+                <span id="videoUploadDate"></span>
+            </div>
+            <div class="video-actions">
+                <button class="action-button" id="likeButton">
+                    <span class="material-icons-round">thumb_up</span>
+                    <span>۱۲۳</span>
+                </button>
+                <button class="action-button" id="dislikeButton">
+                    <span class="material-icons-round">thumb_down</span>
+                </button>
+                <button class="action-button" id="shareButton">
+                    <span class="material-icons-round">share</span>
+                    <span>اشتراک‌گذاری</span>
+                </button>
+                <button class="action-button" id="downloadButton">
+                    <span class="material-icons-round">download</span>
+                    <span>دانلود</span>
+                </button>
+            </div>
+            <div class="channel-info">
+                <div class="channel-avatar">
+                    <img src="assets/default-channel.svg" alt="">
+                </div>
+                <div class="channel-details">
+                    <h3 class="channel-name" id="channelName"></h3>
+                    <span class="subscriber-count" id="subscriberCount"></span>
+                </div>
+                <button class="subscribe-button" id="subscribeButton">عضویت</button>
+            </div>
+            <div class="video-description" id="videoDescription"></div>
+        </div>
+    </div>
+
+    <!-- Bottom Navigation -->
+    <nav class="bottom-navigation">
+        <button class="nav-item nav-item--active" data-page="home">
+            <span class="material-icons-round">home</span>
+            <span class="nav-item__label">آغاز</span>
+        </button>
+        <button class="nav-item" data-page="shorts">
+            <span class="material-icons-round">shorts</span>
+            <span class="nav-item__label">Shorts</span>
+        </button>
+        <button class="nav-item" data-page="create">
+            <span class="material-icons-round nav-item__plus">add_circle</span>
+        </button>
+        <button class="nav-item" data-page="subscriptions">
+            <span class="material-icons-round">subscriptions</span>
+            <span class="nav-item__label">اشتراک‌ها</span>
+        </button>
+        <button class="nav-item" data-page="library">
+            <span class="material-icons-round">video_library</span>
+            <span class="nav-item__label">کتابخانه</span>
+        </button>
+    </nav>
+
+    <!-- Scripts -->
+    <script src="js/app.js" type="module"></script>
+</body>
+</html>

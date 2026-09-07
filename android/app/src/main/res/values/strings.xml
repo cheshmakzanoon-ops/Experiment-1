@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">FamilyTube</string>
+    <string name="loading">Loading…</string>
+    <string name="error_no_internet">No internet connection</string>
+    <string name="retry">Retry</string>
+    <string name="exit_title">Exit App</string>
+    <string name="exit_message">Do you want to exit the app?</string>
+    <string name="yes">Yes</string>
+    <string name="no">No</string>
+    <string name="ok">OK</string>
+    <string name="share_title">Share via</string>
+    <string name="download_saved">Video saved to the Movies folder</string>
+    <string name="download_failed">Download failed</string>
+</resources>

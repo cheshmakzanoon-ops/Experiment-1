@@ -1,0 +1,319 @@
+/* Reset & Base */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    font-family: var(--font-primary);
+    background-color: var(--yt-surface);
+    color: var(--yt-text-primary);
+    line-height: 1.5;
+    overflow-x: hidden;
+    min-height: 100vh;
+    /* Prevent text selection for app feel */
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    /* Prevent pull to refresh */
+    overscroll-behavior-y: contain;
+}
+
+/* App container */
+#app {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    padding-top: var(--top-app-bar-height);
+    padding-bottom: var(--bottom-nav-height);
+}
+
+/* Top App Bar */
+.top-app-bar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    height: var(--top-app-bar-height);
+    background-color: var(--yt-surface);
+    z-index: var(--z-top-app-bar);
+    display: flex;
+    align-items: center;
+    padding: 0 var(--spacing-md);
+    box-shadow: var(--shadow-1);
+}
+
+.top-app-bar__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+}
+
+.top-app-bar__section {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+}
+
+/* In RTL, the start section is on the right */
+[dir="rtl"] .top-app-bar__section--start {
+    order: 1;
+}
+
+[dir="rtl"] .top-app-bar__section--end {
+    order: 2;
+}
+
+/* YouTube Logo */
+.youtube-logo {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.youtube-logo__country {
+    font-size: var(--text-small);
+    color: var(--yt-text-secondary);
+    margin-top: -8px;
+}
+
+/* Icon Buttons */
+.icon-button {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: var(--yt-text-primary);
+    cursor: pointer;
+    border-radius: var(--radius-full);
+    position: relative;
+    transition: background-color var(--transition-fast);
+}
+
+.icon-button:hover {
+    background-color: var(--yt-surface-2);
+}
+
+.icon-button:active {
+    background-color: var(--yt-surface-3);
+}
+
+.icon-button .material-icons-round {
+    font-size: 24px;
+}
+
+/* Notification Badge */
+.badge {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background-color: var(--yt-red);
+    color: var(--yt-white);
+    font-size: var(--text-small);
+    min-width: 16px;
+    height: 16px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+}
+
+/* Profile Avatar */
+.profile-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-full);
+    overflow: hidden;
+    background-color: var(--yt-surface-2);
+}
+
+.profile-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* Main Content */
+.main-content {
+    flex: 1;
+    overflow-y: auto;
+    /* Keep content clear of the fixed top app bar and bottom nav */
+    padding-top: var(--top-app-bar-height);
+    padding-bottom: calc(var(--bottom-nav-height) + var(--spacing-xl));
+}
+
+/* Search overlay open: add room so the feed clears the taller fixed search
+   bar (the top app bar is hidden in that state). Chips visibility is owned
+   by app.js (Home tab + not searching). */
+body.search-open .main-content {
+    padding-top: calc(var(--top-app-bar-height) + var(--spacing-lg));
+}
+
+/* Filter Chips */
+.filter-chips {
+    display: flex;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-sm) var(--spacing-md);
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    border-bottom: 1px solid var(--yt-divider);
+}
+
+.filter-chips::-webkit-scrollbar {
+    display: none;
+}
+
+.filter-chip {
+    display: inline-flex;
+    align-items: center;
+    height: 32px;
+    padding: 0 var(--spacing-md);
+    background-color: var(--yt-surface-2);
+    color: var(--yt-text-primary);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-caption);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+    flex-shrink: 0;
+}
+
+.filter-chip--active {
+    background-color: var(--yt-white);
+    color: var(--yt-black);
+}
+
+.filter-chip:hover:not(.filter-chip--active) {
+    background-color: var(--yt-surface-3);
+}
+
+/* Bottom Navigation */
+.bottom-navigation {
+    position: fixed;
+    bottom: 0;
+    right: 0;
+    left: 0;
+    height: var(--bottom-nav-height);
+    background-color: var(--yt-surface);
+    display: flex;
+    align-items: center;
+    justify-content: space-around;
+    z-index: var(--z-bottom-nav);
+    border-top: 1px solid var(--yt-divider);
+    direction: rtl; /* Force RTL for nav items */
+}
+
+.nav-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    flex: 1;
+    height: 100%;
+    background: none;
+    border: none;
+    color: var(--yt-text-secondary);
+    cursor: pointer;
+    padding: var(--spacing-xs);
+    transition: color var(--transition-fast);
+}
+
+.nav-item--active {
+    color: var(--yt-white);
+}
+
+.nav-item .material-icons-round {
+    font-size: 24px;
+}
+
+.nav-item__label {
+    font-size: var(--text-small);
+    font-weight: 500;
+}
+
+.nav-item__plus {
+    font-size: 36px;
+    color: var(--yt-text-secondary);
+}
+
+/* Loading Spinner */
+.loading-spinner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: var(--spacing-xl);
+    gap: var(--spacing-md);
+}
+
+.spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--yt-surface-2);
+    border-top-color: var(--yt-red);
+    border-radius: var(--radius-full);
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.loading-spinner p {
+    color: var(--yt-text-secondary);
+    font-size: var(--text-body);
+}
+
+/* Error State */
+.error-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: var(--spacing-xl);
+    gap: var(--spacing-md);
+    text-align: center;
+}
+
+.error-state .material-icons-round {
+    font-size: 48px;
+    color: var(--yt-text-tertiary);
+}
+
+.error-state p {
+    color: var(--yt-text-secondary);
+}
+
+.error-state button {
+    padding: var(--spacing-sm) var(--spacing-lg);
+    background-color: var(--yt-surface-2);
+    border: none;
+    color: var(--yt-text-primary);
+    border-radius: var(--radius-full);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: var(--text-body);
+}
+
+/* Video feed list container */
+.video-feed {
+    padding-top: var(--spacing-xs);
+    padding-bottom: var(--spacing-md);
+}
