@@ -1,0 +1,5 @@
+{
+  "defaultVersion": "2026.08.19",
+  "minEjsRuntimeVersion": "2025.06.09",
+  "comment": "Update defaultVersion here to bump the pinned yt-dlp baseline. Server config (config.ts), readiness and scripts/bootstrap-runtime.mjs all read this single file; YT_DLP_VERSION overrides at runtime."
+}

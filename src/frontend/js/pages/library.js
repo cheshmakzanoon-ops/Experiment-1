@@ -25,6 +25,7 @@ import {
     offlineSupported,
     getDownloads,
     getDownload,
+    startDownload,
     cancelDownload,
     removeDownload,
     offlinePlayUrl
@@ -246,7 +247,7 @@ function buildOfflineRow(download) {
     info.appendChild(el('h4', 'compact-video-card__title', download.title || 'بدون عنوان'));
     info.appendChild(el('span', 'compact-video-card__meta', download.author || 'ناشناس'));
 
-    if (download.status === 'downloading') {
+    if (download.status === 'downloading' || download.status === 'paused') {
         const status = el('div', 'offline-download-status');
         status.appendChild(el('span', 'offline-download-status__text', progressLabel(download)));
         const track = el('div', 'download-progress');
@@ -255,28 +256,49 @@ function buildOfflineRow(download) {
         track.appendChild(bar);
         status.appendChild(track);
         info.appendChild(status);
+        if (download.status === 'paused') {
+            info.appendChild(el('div', 'offline-paused-label', 'متوقف — برای ادامه لمس کنید'));
+        }
     } else {
         info.appendChild(
-            el('div', 'offline-ready-label', `آفلاین • ${formatBytes(download.size)}`)
+            el('div', 'offline-ready-label', `آفلاین • ${formatBytes(download.size || download.totalBytes)}`)
         );
     }
     row.appendChild(info);
 
     // ⋮ menu
-    const menuItems =
-        download.status === 'downloading'
-            ? [
-                  {
-                      icon: 'close',
-                      label: 'لغو دانلود',
-                      danger: true,
-                      onClick: () => {
-                          cancelDownload(download.id);
-                          showToast('دانلود لغو شد');
-                      }
-                  }
-              ]
-            : [
+    let menuItems;
+    if (download.status === 'downloading') {
+        menuItems = [
+            {
+                icon: 'close',
+                label: 'لغو دانلود',
+                danger: true,
+                onClick: () => {
+                    cancelDownload(download.id);
+                    showToast('دانلود لغو شد');
+                }
+            }
+        ];
+    } else if (download.status === 'paused') {
+        menuItems = [
+            {
+                icon: 'download',
+                label: 'ادامه دانلود',
+                onClick: () => resumeOfflineRow(download)
+            },
+            {
+                icon: 'delete',
+                label: 'حذف دانلود',
+                danger: true,
+                onClick: () => {
+                    removeDownload(download.id);
+                    showToast('دانلود حذف شد');
+                }
+            }
+        ];
+    } else {
+        menuItems = [
                   {
                       icon: 'play_circle_outline',
                       label: 'پخش آفلاین',
@@ -292,6 +314,7 @@ function buildOfflineRow(download) {
                       }
                   }
               ];
+    }
     const menu = el('button', 'compact-video-card__menu');
     menu.type = 'button';
     menu.setAttribute('aria-label', 'گزینه‌ها');
@@ -302,11 +325,29 @@ function buildOfflineRow(download) {
     });
     row.appendChild(menu);
 
-    // Row tap plays the local copy (ignored while still downloading).
+    // Row tap plays the local copy (ignored while still downloading); a tap
+    // on a paused download resumes it.
     if (download.status === 'ready') {
         row.addEventListener('click', () => playOfflineRow(download));
+    } else if (download.status === 'paused') {
+        row.addEventListener('click', () => resumeOfflineRow(download));
     }
     return row;
+}
+
+/** Resume a paused download (keeps already-downloaded chunks). */
+async function resumeOfflineRow(download) {
+    try {
+        const result = await startDownload(download);
+        if (result.status === 'paused') {
+            showToast('دانلود همچنان متوقف است — اتصال را بررسی کنید');
+        } else if (result.status === 'ready') {
+            showToast('دانلود کامل شد');
+        }
+    } catch (error) {
+        if (!error || error.name === 'cancelled') return;
+        showToast('ادامه دانلود ممکن نشد');
+    }
 }
 
 /** Play a finished download straight from the stored Blob. */
@@ -343,10 +384,13 @@ function updateOfflineRow(row, entry) {
 
 /** Percent (when known) + bytes for the download status line. */
 function progressLabel(entry) {
-    const bytes = formatBytes(entry.size || 0);
+    const bytes = formatBytes(entry.completedBytes || entry.size || 0);
     const progress = entry.progress || 0;
     if (progress > 0 && progress < 1) {
         return `${toPersianDigits(Math.round(progress * 100))}٪ • ${bytes}`;
+    }
+    if (entry.status === 'paused' && progress <= 0) {
+        return `متوقف • ${bytes}`;
     }
     return bytes;
 }

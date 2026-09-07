@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { isValidVideoId } from '../utils/urlValidator.js'
-import { SUPPORTED_QUALITIES, YtDlpError } from '../utils/ytDlp.js'
-import { proxyVideoStream, probeVideoStream } from '../services/youtube/streamProxy.js'
+import { SUPPORTED_QUALITIES } from '../services/youtube/extractor.js'
+import { proxyVideoStream, probeVideoStream, mapStreamFailure } from '../services/youtube/streamProxy.js'
 import { streamCache } from '../middleware/streamCache.js'
 
 const streamRoutes = new Hono()
@@ -14,40 +14,20 @@ function qualityValue(raw: string | undefined): number | null {
   return parseInt(quality, 10)
 }
 
-/** Map proxy/extraction failures onto a JSON error body. */
-function errorBody(error: unknown) {
-  const yt = error instanceof YtDlpError ? error : null
-  const status = yt?.code && yt.code >= 400 && yt.code <= 599 ? yt.code : 500
-  const labels: Record<number, string> = {
-    400: 'INVALID_ID',
-    404: 'NOT_FOUND',
-    403: 'FORBIDDEN',
-    429: 'RATE_LIMITED',
-    501: 'NOT_SUPPORTED',
-    502: 'UPSTREAM_ERROR',
-    504: 'TIMEOUT'
-  }
-  return {
-    status,
-    body: {
-      error: yt?.message || 'Internal stream error',
-      code: labels[status] || 'STREAM_ERROR'
-    }
-  }
-}
-
 // --- GET /api/stream/stats -------------------------------------------------
-// Cache statistics (registered before /stream/:id so "stats" is not parsed
-// as a video id).
+// Cache statistics — protected (session) and cheap.
 streamRoutes.get('/stream/stats', (c) => {
+  const stats = streamCache.getStats()
   return c.json({
-    ...streamCache.getStats(),
+    ...stats,
+    // Expose only what the household operator needs to see.
     timestamp: new Date().toISOString()
   })
 })
 
 // --- GET /api/stream/:id/probe ---------------------------------------------
-// Lightweight availability check (extracts if needed, requests 1 KB upstream).
+// Explicit availability probe (used by diagnostics only; normal playback
+// never performs a probe round-trip).
 streamRoutes.get('/stream/:id/probe', async (c) => {
   const videoId = c.req.param('id')
   if (!isValidVideoId(videoId)) {
@@ -59,14 +39,14 @@ streamRoutes.get('/stream/:id/probe', async (c) => {
     return c.json({ error: `Invalid quality. Must be one of: ${QUALITY_PARAM}` }, 400)
   }
 
-  const result = await probeVideoStream(videoId, maxHeight)
+  const result = await probeVideoStream(videoId, maxHeight, { signal: c.req.raw.signal })
   return c.json(result)
 })
 
 // --- GET /api/stream/:id ----------------------------------------------------
-// The byte-relaying streaming proxy. Range requests pass through to the
-// upstream, so a seek produces 206 Partial Content with a Content-Range.
-// HEAD is served by Hono from this GET handler with the body dropped.
+// The byte-relaying streaming proxy. Session cookie authenticates; the
+// client's Range header is forwarded verbatim and relayed 206 semantics
+// preserved. HEAD is served from this GET handler with the body dropped.
 streamRoutes.get('/stream/:id', async (c) => {
   const videoId = c.req.param('id')
 
@@ -83,8 +63,16 @@ streamRoutes.get('/stream/:id', async (c) => {
     const response = await proxyVideoStream(c, videoId, maxHeight)
     return response
   } catch (error) {
-    const { status, body } = errorBody(error)
-    return c.json(body, status as 400 | 403 | 404 | 429 | 500 | 501 | 502 | 504)
+    const failure = mapStreamFailure(error)
+    if (failure.status === 499) {
+      // Client disconnected — nothing to send.
+      return new Response(null, { status: 499 })
+    }
+    return c.json(
+      { error: failure.error, code: failure.code },
+      failure.status as 400 | 403 | 404 | 416 | 429 | 500 | 501 | 502 | 503 | 504,
+      failure.retryAfterSeconds ? { 'Retry-After': String(failure.retryAfterSeconds) } : undefined
+    )
   }
 })
 

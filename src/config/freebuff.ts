@@ -1,22 +1,22 @@
-import { streamCache } from '../middleware/streamCache.js'
-
 /**
  * FreeBuff-deployment helpers.
  *
- * FreeBuff previews are dev sandboxes, not production hosting: they can go
- * idle/sleep after a period without traffic, and their bandwidth limits are
- * unknown. This module provides:
- *
- *   - a keepalive that pings /api/health AND an external service so an idle
- *     preview stays awake (idle detection often measures external egress,
- *     which a loopback self-ping never generates),
- *   - a bandwidth monitor that counts bytes relayed through the server
- *     (both Content-Length responses and wrapped streaming bodies),
- *   - an assessment endpoint helper that flags resource pressure.
+ *   - an OPTIONAL keepalive (KEEPALIVE_ENABLED=false by default) that pings
+ *     /api/health/live and — only when KEEPALIVE_EXTERNAL_URL is configured —
+ *     one external endpoint. It is documented as an experiment: a process
+ *     pinging itself does not prove an external Freebuff ingress stays
+ *     alive, and platform lifecycle behaviour is not something app code can
+ *     reliably override. The timer is unref'd and never blocks shutdown,
+ *   - a bandwidth monitor counting bytes served (Content-Length responses +
+ *     streamed relays),
+ *   - a resource-pressure assessment used by protected diagnostics.
  */
 
+import { config } from '../config.js'
+import { streamCache } from '../middleware/streamCache.js'
+
 // ---------------------------------------------------------------------------
-// Keepalive service
+// Keepalive service (optional)
 // ---------------------------------------------------------------------------
 
 export interface KeepaliveStatus {
@@ -26,8 +26,7 @@ export interface KeepaliveStatus {
   lastInternalOk: boolean | null
   lastExternalOk: boolean | null
   internalPingCount: number
-  externalOkCount: number
-  externalUrl: string
+  externalUrl: string | null
 }
 
 class KeepaliveService {
@@ -37,43 +36,27 @@ class KeepaliveService {
   private lastInternalOk: boolean | null = null
   private lastExternalOk: boolean | null = null
   private internalPingCount = 0
-  private externalOkCount = 0
 
-  /** Lightweight external endpoint hit on every tick (egress traffic). */
-  private externalUrl = process.env.KEEPALIVE_EXTERNAL_URL || 'https://api.ipify.org'
+  private externalUrl = process.env.KEEPALIVE_EXTERNAL_URL || null
 
-  /**
-   * Ping our own /api/health AND an external service every `intervalMinutes`
-   * minutes. The internal ping verifies the server is responsive; the
-   * external ping generates real network egress, which is what
-   * idle-detection systems typically measure. Failures are logged but never
-   * crash or stop the loop.
-   */
-  start(intervalMinutes: number): void {
-    if (this.intervalId) {
-      console.log(`[keepalive] Already running (every ${this.intervalMinutes} minutes)`)
+  /** Start only when KEEPALIVE_ENABLED=true; interval from config. */
+  start(): void {
+    if (this.intervalId) return
+    if (!config.keepaliveEnabled) {
+      console.log('[keepalive] Disabled (KEEPALIVE_ENABLED not true)')
       return
     }
 
-    if (intervalMinutes < 1) {
-      console.warn('[keepalive] Interval must be >= 1 minute; using 4')
-      intervalMinutes = 4
-    }
+    this.intervalMinutes = Math.max(1, config.keepaliveIntervalMinutes)
+    const port = config.port
 
-    this.intervalMinutes = intervalMinutes
-    const port = process.env.PORT || 3000
-
-    this.intervalId = setInterval(() => {
+    const intervalId = setInterval(() => {
       void (async () => {
         const results = await Promise.allSettled([
-          // Internal health check (loopback — proves the server is alive).
-          fetch(`http://127.0.0.1:${port}/api/health`, {
-            signal: AbortSignal.timeout(5000)
-          }),
-          // External ping (generates real egress traffic).
-          fetch(this.externalUrl, {
-            signal: AbortSignal.timeout(10000)
-          })
+          fetch(`http://127.0.0.1:${port}/api/health/live`, { signal: AbortSignal.timeout(5000) }),
+          ...(this.externalUrl
+            ? [fetch(this.externalUrl, { signal: AbortSignal.timeout(10_000) })]
+            : [])
         ])
 
         this.lastPingAt = Date.now()
@@ -82,38 +65,34 @@ class KeepaliveService {
 
         if (internal.status === 'fulfilled' && internal.value.ok) {
           this.lastInternalOk = true
-          // Keep the log quiet — log ~10% of successful internal pings.
-          if (Math.random() < 0.1) {
-            console.log(`[keepalive] Ping ok at ${new Date().toISOString()}`)
-          }
         } else {
           this.lastInternalOk = false
           const detail =
             internal.status === 'fulfilled'
-              ? `/api/health returned ${internal.value.status}`
+              ? `HTTP ${internal.value.status}`
               : internal.reason instanceof Error
                 ? internal.reason.message
                 : String(internal.reason)
-          console.warn(`[keepalive] Internal health check failed: ${detail}`)
+          console.warn(`[keepalive] Internal liveness check failed: ${detail}`)
         }
 
-        if (external.status === 'fulfilled') {
-          this.lastExternalOk = true
-          this.externalOkCount += 1
-          // Log ~10% of successful external pings to avoid log spam.
-          if (Math.random() < 0.1) {
-            console.log(`[keepalive] External ping ok at ${new Date().toISOString()}`)
+        if (external) {
+          if (external.status === 'fulfilled') {
+            this.lastExternalOk = true
+          } else {
+            this.lastExternalOk = false
+            console.warn('[keepalive] External ping failed')
           }
-        } else {
-          this.lastExternalOk = false
-          console.warn('[keepalive] External ping failed — may indicate network issues')
         }
       })()
-    }, intervalMinutes * 60 * 1000)
+    }, this.intervalMinutes * 60 * 1000)
+    // Never let the keepalive prevent a clean process shutdown.
+    intervalId.unref()
+    this.intervalId = intervalId
 
     console.log(
-      `[keepalive] Started — pinging every ${intervalMinutes} minutes ` +
-        `(internal /api/health + external ${this.externalUrl})`
+      `[keepalive] Enabled — every ${this.intervalMinutes} minutes ` +
+        (this.externalUrl ? `(internal + external ${this.externalUrl})` : '(internal only)')
     )
   }
 
@@ -122,7 +101,6 @@ class KeepaliveService {
       clearInterval(this.intervalId)
       this.intervalId = null
       this.intervalMinutes = 0
-      console.log('[keepalive] Stopped')
     }
   }
 
@@ -134,7 +112,6 @@ class KeepaliveService {
       lastInternalOk: this.lastInternalOk,
       lastExternalOk: this.lastExternalOk,
       internalPingCount: this.internalPingCount,
-      externalOkCount: this.externalOkCount,
       externalUrl: this.externalUrl
     }
   }
@@ -158,13 +135,9 @@ export interface BandwidthStats {
 }
 
 /**
- * Counts bytes served to clients and derives running Mbps figures.
- *
- * Two sources feed this monitor:
- *   - the generic middleware counts Content-Length responses,
- *   - the stream-byte-counter middleware (src/middleware/streamByteCounter.ts)
- *     counts bytes that actually flow through wrapped /api/stream bodies
- *     (chunked relays would otherwise be invisible to Content-Length).
+ * Counts bytes served to clients. Two sources feed it: the generic
+ * middleware counts Content-Length responses; the stream-byte-counter
+ * middleware counts bytes actually flowing through wrapped stream bodies.
  */
 class BandwidthMonitor {
   private totalBytesServed = 0
@@ -172,12 +145,14 @@ class BandwidthMonitor {
   private startTime = Date.now()
   private peakBytesPerSecond = 0
   private bytesThisSecond = 0
+  private secondTimer: ReturnType<typeof setInterval> | null = null
 
   constructor() {
-    setInterval(() => {
+    this.secondTimer = setInterval(() => {
       this.peakBytesPerSecond = Math.max(this.peakBytesPerSecond, this.bytesThisSecond)
       this.bytesThisSecond = 0
-    }, 1000).unref()
+    }, 1000)
+    this.secondTimer.unref()
   }
 
   trackBytes(bytes: number): void {
@@ -201,14 +176,6 @@ class BandwidthMonitor {
       averageMbps: ((averageBytesPerSecond * 8) / 1024 / 1024).toFixed(2) + ' Mbps',
       trackingMode: 'mixed'
     }
-  }
-
-  reset(): void {
-    this.totalBytesServed = 0
-    this.responseCount = 0
-    this.startTime = Date.now()
-    this.peakBytesPerSecond = 0
-    this.bytesThisSecond = 0
   }
 }
 
@@ -234,7 +201,7 @@ export function assessSandboxHealth(): SandboxHealth {
   const memPercent = memTotalMB > 0 ? (memUsedMB / memTotalMB) * 100 : 0
 
   if (memPercent > 85) {
-    issues.push(`High heap usage: ${memPercent.toFixed(1)}% (${memUsedMB.toFixed(0)}/${memTotalMB.toFixed(0)} MB)`)
+    issues.push(`High heap usage: ${memPercent.toFixed(1)}%`)
     recommendations.push('Reduce the stream-cache max size or restart the server')
   }
 

@@ -1,15 +1,22 @@
 /**
- * URL and video ID validation helpers.
+ * URL and video-ID validation for outbound media/metadata requests.
  *
- * YouTube "googlevideo.com" stream URLs are signed and can contain arbitrary
- * query parameters, so validation is deliberately conservative: we only
- * restrict the scheme and the host suffix, never the full URL shape.
+ * YouTube "googlevideo.com" stream URLs are signed and may carry arbitrary
+ * query parameters, so URL shape is deliberately not constrained beyond the
+ * scheme, host allowlist, and the absence of embedded credentials.
+ *
+ * This allowlist is the trust boundary for EVERY outbound request the proxy
+ * makes (stream relay, probes, thumbnails, diagnostics) and is re-applied on
+ * every redirect hop (see src/utils/net.ts).
  */
 
-/** YouTube video IDs are exactly 11 chars of [A-Za-z0-9_-]. */
 export const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/
 
-/** Hosts we are willing to proxy media/metadata from. */
+/**
+ * Hosts the server is willing to fetch media/metadata from. Matching is an
+ * exact host or a subdomain of an allowlisted suffix — `googlevideo.com.evil.example`
+ * never matches.
+ */
 export const ALLOWED_STREAM_HOSTS = [
   'googlevideo.com',
   'youtube.com',
@@ -17,67 +24,85 @@ export const ALLOWED_STREAM_HOSTS = [
   'ytimg.com',
   'ggpht.com',
   'googleusercontent.com'
-]
+] as const
 
 export function isValidVideoId(id: string): boolean {
   return VIDEO_ID_RE.test(id)
 }
 
-/**
- * Normalize a hostname and check it (or a subdomain of it) is allowed.
- */
+/** Exact host or a subdomain of an allowlisted suffix. */
 export function isAllowedHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^www\./, '')
+  const host = hostname.toLowerCase()
   return ALLOWED_STREAM_HOSTS.some(
     (allowed) => host === allowed || host.endsWith(`.${allowed}`)
   )
 }
 
-/**
- * Parse a video ID out of either a bare ID or common YouTube URL shapes
- * (watch?v=, youtu.be/, shorts/, embed/). Returns null when not valid.
- */
-export function parseVideoId(input: string): string | null {
-  const trimmed = input.trim()
-  if (VIDEO_ID_RE.test(trimmed)) return trimmed
-
-  try {
-    const url = new URL(trimmed)
-    if (url.hostname.includes('youtu.be')) {
-      const id = url.pathname.split('/').filter(Boolean)[0] || ''
-      return isValidVideoId(id) ? id : null
-    }
-    if (url.hostname.includes('youtube.com')) {
-      const v = url.searchParams.get('v')
-      if (v && isValidVideoId(v)) return v
-      // /shorts/<id>, /embed/<id>, /v/<id>
-      const parts = url.pathname.split('/').filter(Boolean)
-      const maybeId = parts[parts.length - 1]
-      if (isValidVideoId(maybeId)) return maybeId
-    }
-  } catch {
-    // Not a URL and not a bare 11-char id
-    return null
+export class UnsafeUrlError extends Error {
+  constructor(message: string, public reason: 'scheme' | 'host' | 'credentials' | 'malformed') {
+    super(message)
+    this.name = 'UnsafeUrlError'
   }
-  return null
 }
 
 /**
- * Validate that a stream URL is http(s) and points at an allowed host.
- * Throws when unsafe. Used before the server relays bytes downstream.
+ * Validate that an outbound URL may be fetched. External media is HTTPS
+ * only; http is accepted solely for local/private diagnostics hooks that
+ * explicitly opt in via `allowHttp`.
  */
-export function assertSafeStreamUrl(rawUrl: string): URL {
+export function assertSafeMediaUrl(rawUrl: string, allowHttp = false): URL {
   let url: URL
   try {
     url = new URL(rawUrl)
   } catch {
-    throw new Error('Refusing to proxy invalid stream URL')
+    throw new UnsafeUrlError('Refusing to proxy a malformed URL', 'malformed')
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(`Refusing to proxy non-http URL (${url.protocol})`)
+
+  if (url.username || url.password) {
+    throw new UnsafeUrlError('Refusing to proxy a URL with embedded credentials', 'credentials')
   }
+
+  const https = url.protocol === 'https:'
+  const http = url.protocol === 'http:'
+  if (!https && !(allowHttp && http)) {
+    throw new UnsafeUrlError(`Refusing to proxy non-HTTPS URL (${url.protocol})`, 'scheme')
+  }
+
   if (!isAllowedHost(url.hostname)) {
-    throw new Error(`Refusing to proxy URL from disallowed host ${url.hostname}`)
+    throw new UnsafeUrlError(`Refusing to proxy URL from disallowed host ${url.hostname}`, 'host')
   }
+
   return url
+}
+
+/**
+ * Resolve one redirect hop (RFC 7231): build the next absolute URL from a
+ * `Location` header and re-validate it against the same allowlist as the
+ * initial URL. Returns the validated absolute URL, or a rejection reason.
+ * Used on EVERY hop of the manual redirect chain (see src/utils/net.ts) so
+ * a safe→unsafe redirect can never slip through.
+ */
+export function resolveRedirectTarget(
+  currentUrl: string,
+  location: string | null | undefined,
+  allowHttp = false
+): { ok: true; url: string } | { ok: false; reason: string } {
+  if (!location || location.trim() === '') {
+    return { ok: false, reason: 'redirect without a Location header' }
+  }
+  let resolved: URL
+  try {
+    resolved = new URL(location.trim(), currentUrl)
+  } catch {
+    return { ok: false, reason: 'malformed redirect Location' }
+  }
+  try {
+    const safe = assertSafeMediaUrl(resolved.toString(), allowHttp)
+    return { ok: true, url: safe.toString() }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof UnsafeUrlError ? error.message : 'unsafe redirect target'
+    }
+  }
 }

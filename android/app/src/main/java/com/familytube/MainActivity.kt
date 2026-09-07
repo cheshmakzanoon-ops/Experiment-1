@@ -26,6 +26,16 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
  * routes the system back button through WebView history, surfaces a Persian
  * offline page when the server is unreachable, exposes the [JavaScriptBridge]
  * ("AndroidBridge") to the page, and auto-reloads once connectivity returns.
+ *
+ * Security invariants (see AppSecurity.kt):
+ *   • the WebView only ever renders the trusted origin derived from
+ *     BuildConfig.WEBAPP_URL (enforced by FamilyWebViewClient),
+ *   • deep-link video ids must match the exact YouTube id shape before any
+ *     use, and are inserted into JavaScript only through JSON quoting,
+ *   • every JS-bridge method that touches network/storage first verifies
+ *     the current main frame is the trusted origin,
+ *   • the native download path never trusts a caller-supplied URL — it
+ *     rebuilds the URL from the trusted origin + validated video id.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -35,6 +45,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var networkMonitor: NetworkMonitor
     private val downloadBridge by lazy { DownloadManagerBridge(this) }
     private val offlineStorage by lazy { OfflineStorageHelper(this) }
+
+    /** Normalized trusted origin, e.g. "https://family.example.com". */
+    private val trustedOrigin: String =
+        AppSecurity.originOf(BuildConfig.WEBAPP_URL).orEmpty()
+
+    /** True while the main frame is on the trusted origin (bridge gate). */
+    @Volatile
+    private var mainFrameTrusted = false
 
     /** Deep link (familytube://watch?v=…) received before the page finished. */
     private var pendingDeepLinkVideoId: String? = null
@@ -75,13 +93,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Intent (deep link) is parsed before the page loads; it is applied
-        // once the first page has finished loading (see onNativePageFinished).
+        // once the first trusted page has finished loading.
         handleIntent(intent)
 
         loadWebApp()
     }
 
-    @Suppress("DEPRECATION") // setDatabaseEnabled / mixedContentMode warn on some SDK levels
+    @Suppress("DEPRECATION") // setDatabaseEnabled warns on some SDK levels
     private fun setupWebView() {
         webView.settings.apply {
             javaScriptEnabled = true
@@ -92,10 +110,9 @@ class MainActivity : AppCompatActivity() {
             // Autoplay is user-initiated in this app, but keep media seamless.
             mediaPlaybackRequiresUserGesture = false
 
-            // Mixed content: dev/preview deployments may serve over HTTP while
-            // some resources are HTTPS. The network security config restricts
-            // which cleartext hosts are allowed.
-            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            // The app is fully same-origin (UI + proxied media): never mix
+            // cleartext into an HTTPS page.
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
 
             // Mimic a current Chrome mobile UA — our own UI, so this only
             // matters for any site sniffing code inside the page.
@@ -113,6 +130,9 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = FamilyWebViewClient(this)
         webView.webChromeClient = FamilyWebChromeClient()
 
+        // The bridge is added once; every method re-validates that the
+        // current main frame is the trusted origin before acting, so the
+        // interface can never be abused from untrusted content.
         webView.addJavascriptInterface(JavaScriptBridge(), "AndroidBridge")
 
         swipeRefresh.setOnRefreshListener {
@@ -139,33 +159,88 @@ class MainActivity : AppCompatActivity() {
         return url == "about:blank" || url.startsWith("data:")
     }
 
+    // -----------------------------------------------------------------------
+    // Trusted-origin tracking (main thread; read by bridge methods)
+    // -----------------------------------------------------------------------
+
+    /** Called by FamilyWebViewClient whenever the main-frame URL changes. */
+    fun onMainFrameUrlChanged(url: String?) {
+        mainFrameTrusted = url != null && AppSecurity.isTrustedUrl(url, trustedOrigin)
+        if (!mainFrameTrusted) {
+            // Untrusted content must never carry the app's deep-link state.
+            pendingDeepLinkVideoId = null
+        }
+    }
+
+    /** Bridge gate: only the trusted origin may touch native capabilities. */
+    fun isBridgeAllowed(): Boolean = mainFrameTrusted
+
+    // -----------------------------------------------------------------------
+    // Deep links
+    // -----------------------------------------------------------------------
+
     /**
-     * Parses deep links such as `familytube://watch?v=abc123`. The web app
-     * has no hash router today, so the link is stored and turned into a
-     * `#/watch?v=…` hash once the shell has loaded (harmless if unused).
+     * Parses deep links such as `familytube://watch?v=abc123`. The video id
+     * is validated against the exact YouTube id shape before it is stored;
+     * anything else is ignored. The web app has no hash router today, so
+     * the link is turned into a `#/watch?v=…` hash once the shell has
+     * loaded (harmless if unused).
      */
     private fun handleIntent(intent: Intent?) {
         val data: Uri? = intent?.data
-        if (data == null || data.scheme != "familytube") return
-        if (data.host != "watch") return
-        val videoId = data.getQueryParameter("v").orEmpty()
-        if (videoId.isNotEmpty()) {
+        if (data == null ||
+            !data.scheme.equals(AppSecurity.DEEP_LINK_SCHEME, ignoreCase = true) ||
+            !data.host.equals(AppSecurity.DEEP_LINK_HOST, ignoreCase = true)
+        ) {
+            return
+        }
+        val videoId = data.getQueryParameter(AppSecurity.DEEP_LINK_QUERY_KEY)
+        if (AppSecurity.isValidVideoId(videoId)) {
             pendingDeepLinkVideoId = videoId
+        }
+    }
+
+    /** Called from FamilyWebViewClient for a validated familytube link. */
+    fun openVideoDeepLink(videoId: String) {
+        if (!AppSecurity.isValidVideoId(videoId)) return
+        runOnUiThread {
+            if (initialPageFinished && mainFrameTrusted) {
+                applyDeepLink(videoId)
+            } else {
+                pendingDeepLinkVideoId = videoId
+            }
         }
     }
 
     /** Called from FamilyWebViewClient.onPageFinished (main thread). */
     fun onNativePageFinished(url: String?) {
-        // Apply a pending deep link exactly once, after the first real page.
+        // Only the trusted origin's first real page counts as "finished".
+        if (url == null || !AppSecurity.isTrustedUrl(url, trustedOrigin)) return
         if (!initialPageFinished) {
             initialPageFinished = true
             val videoId = pendingDeepLinkVideoId
-            if (videoId != null && !videoId.isEmpty()) {
-                webView.evaluateJavascript(
-                    "window.location.hash = '#/watch?v=$videoId';", null
-                )
+            if (videoId != null) {
+                applyDeepLink(videoId)
                 pendingDeepLinkVideoId = null
             }
+        }
+    }
+
+    /** Navigate to the watch hash — the id is JSON-quoted, never raw. */
+    private fun applyDeepLink(videoId: String) {
+        // videoId is regex-validated already; quoting is defense in depth.
+        val quoted = AppSecurity.jsQuote("watch?v=$videoId")
+        webView.evaluateJavascript("window.location.hash = '#/' + $quoted;", null)
+    }
+
+    /** Deep links arriving while the activity is already running. */
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+        val videoId = pendingDeepLinkVideoId
+        if (videoId != null && initialPageFinished && mainFrameTrusted) {
+            pendingDeepLinkVideoId = null
+            applyDeepLink(videoId)
         }
     }
 
@@ -189,27 +264,41 @@ class MainActivity : AppCompatActivity() {
     /**
      * "AndroidBridge" — the JavaScript interface the web app talks to through
      * `window.AndroidBridge` (see src/frontend/js/utils/nativeApp.js).
+     *
+     * Methods that expose native capabilities (share sheet, storage info,
+     * downloads, cache clearing) refuse to run unless the current main
+     * frame is the trusted application origin — so even if some untrusted
+     * frame ever got script into the WebView, it could not reach them.
      */
     inner class JavaScriptBridge {
 
         @android.webkit.JavascriptInterface
         fun showToast(message: String) {
+            // Cosmetic only — always allowed.
             runOnUiThread {
-                Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, AppSecurity.safeLabel(message, 120), Toast.LENGTH_SHORT).show()
             }
         }
 
         @android.webkit.JavascriptInterface
         fun isNetworkAvailable(): Boolean {
+            if (!isBridgeAllowed()) return false
             return networkMonitor.isConnected()
         }
 
         @android.webkit.JavascriptInterface
         fun downloadVideo(videoId: String, title: String, url: String): Boolean {
-            // Offline downloads normally run inside the web app (service
-            // worker + IndexedDB through the stream proxy). This native path
-            // is a fallback for saving a copy to the device's Movies folder.
-            downloadBridge.downloadVideo(videoId, title, url) { success ->
+            // Never trust a caller-supplied URL. Only a validated video id
+            // on the trusted origin may be enqueued, and the URL is rebuilt
+            // canonically from the trusted origin + the id.
+            if (!isBridgeAllowed()) return false
+            if (!AppSecurity.isValidVideoId(videoId)) return false
+            val canonicalUrl = "$trustedOrigin/api/stream/$videoId?quality=240"
+            downloadBridge.downloadVideo(
+                videoId,
+                AppSecurity.safeLabel(title),
+                canonicalUrl
+            ) { success ->
                 runOnUiThread {
                     Toast.makeText(
                         this@MainActivity,
@@ -224,16 +313,19 @@ class MainActivity : AppCompatActivity() {
 
         @android.webkit.JavascriptInterface
         fun getStorageInfo(): String {
+            if (!isBridgeAllowed()) return "{}"
             return offlineStorage.storageInfoJson()
         }
 
         @android.webkit.JavascriptInterface
         fun clearAppCache(): Boolean {
+            if (!isBridgeAllowed()) return false
             return offlineStorage.clearAppCache()
         }
 
         @android.webkit.JavascriptInterface
         fun requestPersistentStorage(): Boolean {
+            if (!isBridgeAllowed()) return false
             // Android 13+ never evicts app storage without user action. On
             // older versions ask the WebView to persist its quota (best
             // effort — the web app also keeps IndexedDB downloads working).
@@ -247,10 +339,20 @@ class MainActivity : AppCompatActivity() {
 
         @android.webkit.JavascriptInterface
         fun shareVideo(title: String, url: String) {
+            if (!isBridgeAllowed()) return
+            val shareUrl = url.trim()
+            // Only http(s) URLs may leave the device via the share sheet.
+            val uri = try {
+                Uri.parse(shareUrl)
+            } catch (_: Exception) {
+                return
+            }
+            if (!AppSecurity.isWebScheme(uri.scheme)) return
+
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
-                putExtra(Intent.EXTRA_TEXT, url)
-                putExtra(Intent.EXTRA_TITLE, title)
+                putExtra(Intent.EXTRA_TEXT, shareUrl)
+                putExtra(Intent.EXTRA_TITLE, AppSecurity.safeLabel(title))
             }
             startActivity(Intent.createChooser(shareIntent, getString(R.string.share_title)))
         }
@@ -258,6 +360,8 @@ class MainActivity : AppCompatActivity() {
         /** Called by the offline fallback page's «تلاش مجدد» button. */
         @android.webkit.JavascriptInterface
         fun reloadApp() {
+            // Deliberately NOT gated: the fallback page only ever re-loads
+            // the trusted application URL.
             runOnUiThread {
                 loadWebApp()
             }

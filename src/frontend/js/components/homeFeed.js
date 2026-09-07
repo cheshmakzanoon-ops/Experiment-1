@@ -95,19 +95,6 @@ function observeSentinel(node) {
     if (node) io().observe(node);
 }
 
-// --- DOM helpers -------------------------------------------------------------
-function ensureWrapper(container) {
-    let wrapper = document.getElementById(VIEW_ID);
-    if (wrapper && wrapper.parentNode === container) return wrapper;
-
-    // Coming back to Home from another page: replace whatever is in the feed.
-    clear(container);
-    wrapper = el('div', '', '');
-    wrapper.id = VIEW_ID;
-    container.appendChild(wrapper);
-    return wrapper;
-}
-
 function paintSkeletons(wrapper) {
     clear(wrapper);
     for (let i = 0; i < 6; i++) {
@@ -182,9 +169,10 @@ function showLoadMoreIndicator(wrapper) {
 
 /** Which endpoint serves the given category. */
 function fetchFeedPage(categoryId, page) {
-    // The API caps pagination (20 pages for home, 10 per category); stop
-    // asking before the server would answer 400.
-    const maxPage = categoryId === 'all' ? 20 : 10;
+    // The server pages a cached 50-entry batch honestly: past the batch it
+    // answers empty with hasMore:false. Keep the client cap well above the
+    // real availability so the server's honest answer drives the stop.
+    const maxPage = 50;
     if (page > maxPage) {
         return Promise.resolve({ videos: [], hasMore: false });
     }
@@ -245,7 +233,7 @@ async function loadMore() {
     state.loading = true;
     const genAtStart = generation;
     const wrapper = viewEl;
-    const indicator = showLoadMoreIndicator(wrapper);
+    showLoadMoreIndicator(wrapper);
 
     try {
         let page = state.page;

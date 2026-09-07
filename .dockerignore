@@ -1,0 +1,24 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Downloaded runtime binaries (re-bootstrapped inside the image)
+.runtime/
+
+# Git / local state
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Build residue
+android/.gradle/
+android/**/build/
+*.apk
+*.aab
+
+# Logs / OS noise
+*.log
+.DS_Store

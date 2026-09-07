@@ -1,24 +1,27 @@
+# Docker is the SECONDARY deployment route for this project — the primary
+# runtime is Freebuff Cloud (repo scripts + pinned runtime bootstrap, no
+# Docker). This compose file remains a valid self-hosted option.
+#
+# Secrets are read from the shell environment / an optional .env next to
+# this file (docker compose interpolates ${VAR} automatically). Never commit
+# real secrets. ACCESS_KEY + SESSION_SECRET are REQUIRED for production
+# (auth fails CLOSED when they are missing unless AUTH_DISABLED=true).
 services:
   app:
     build: .
     container_name: experiment-1
     ports:
       - "3000:3000"
-    env_file:
-      - .env
     environment:
       NODE_ENV: production
-      # Comment out to use the bgutil provider sidecar below:
-      # YT_PO_PROVIDER_URL: http://127.0.0.1:4416
+      ACCESS_KEY: ${ACCESS_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
+      ENABLE_DIAGNOSTICS: ${ENABLE_DIAGNOSTICS:-false}
+      YT_DLP_CONCURRENCY: ${YT_DLP_CONCURRENCY:-2}
+      YT_DLP_QUEUE_MAX: ${YT_DLP_QUEUE_MAX:-16}
+      YT_PROXY_URL: ${YT_PROXY_URL:-}
+      YT_PLAYER_CLIENTS: ${YT_PLAYER_CLIENTS:-}
+      KEEPALIVE_ENABLED: ${KEEPALIVE_ENABLED:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     restart: unless-stopped
-
-  # Optional — PO-token provider sidecar (see POTOKEN.md). The app mints
-  # Proof-of-Origin tokens through it (default http://127.0.0.1:4416) so
-  # yt-dlp can bypass YouTube's datacenter-IP bot-wall. Only needed when the
-  # sandbox IP is blocked; uncomment to enable:
-  #
-  # pot-provider:
-  #   image: brainicism/bgutil-ytdlp-pot-provider:latest
-  #   container_name: bgutil-pot-provider
-  #   restart: unless-stopped
-  #   network_mode: service:app   # localhost-only access from the app

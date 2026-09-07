@@ -1,59 +1,44 @@
-# Use Node.js 20 slim as base
-FROM node:20-slim
+# Secondary deployment route — the PRIMARY runtime is Freebuff Cloud, which
+# clones the repo, installs dependencies and runs the repo's own scripts.
+# This image uses the SAME runtime strategy as Freebuff: the pinned official
+# yt-dlp standalone binary is bootstrapped into .runtime/bin/ (gitignored)
+# and verified by SHA-256 — no pip, no Python, no ffmpeg, no Chromium needed.
+# The app selects a single progressive media URL and byte-relays it, so
+# ffmpeg is not required anywhere in the pipeline.
 
-# Install system dependencies: Python for yt-dlp, ffmpeg, and Chromium for
-# PO-token generation (the bgutil provider runs headless Chromium to mint
-# Proof-of-Origin tokens that bypass YouTube's datacenter-IP bot-wall).
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    ffmpeg \
-    curl \
-    wget \
-    ca-certificates \
-    chromium \
-    chromium-driver \
-    fonts-liberation && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+FROM node:22-slim
 
-# Install yt-dlp and the bgutil PO-token provider PLUGIN (pip) so modern
-# yt-dlp (>= 2025.05.22) can fetch tokens automatically when a bgutil
-# provider server is reachable on port 4416 (or a script provider exists).
-# The provider server itself is NOT on npm: run it as a sidecar container
-# (see docker-compose.yml) or clone+build Brainicism/bgutil-ytdlp-pot-provider
-# and make its binary available on PATH — see POTOKEN.md.
-RUN pip3 install --no-cache-dir --break-system-packages \
-    yt-dlp \
-    bgutil-ytdlp-pot-provider
+# A health check later and the Node runtime itself are the only runtime
+# needs; keep the image minimal.
+ENV NODE_ENV=production
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* ./
+# Install dependencies FIRST so the layer cache survives source changes.
+# `npm ci` fails hard on a lockfile mismatch — never fall back to install.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
-# Install ALL dependencies first (build needs devDependencies, e.g. tsc)
-RUN npm ci 2>/dev/null || npm install
-
-# Copy source code
+# Copy the source tree (node_modules/dist/.runtime excluded via .dockerignore).
 COPY . .
 
-# Build TypeScript, then drop devDependencies to slim the image
-RUN npm run build && npm prune --omit=dev
+# Bootstrap the pinned yt-dlp standalone binary (idempotent, SHA-256
+# verified). Node 22 provides the modern EJS/js-runtime for yt-dlp's
+# JavaScript challenges via `--js-runtimes node` in the centralized runner.
+RUN npm run bootstrap:runtime && npm run build
 
-# Create non-root user
+# Run as a non-root user.
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-# Expose port
 EXPOSE 3000
 
-# Health check (route is /api/health)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://127.0.0.1:3000/api/health || exit 1
+# Health check honors $PORT (default 3000) — does not assume a fixed port.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-# Start the application
-CMD ["node", "dist/index.js"]
+# `npm start` runs the idempotent `prestart` runtime verification first,
+# then the compiled server (which itself fails readiness precisely when the
+# runtime is missing — never a later ENOENT storm on user requests).
+CMD ["npm", "start"]

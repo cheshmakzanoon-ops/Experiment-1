@@ -6,10 +6,58 @@ plugins {
 // Web app URL baked into BuildConfig.WEBAPP_URL at build time.
 //
 // Priority: -PWEBAPP_URL="https://..." on the command line → the WEBAPP_URL
-// property in gradle.properties → this default. Point it at the public,
-// always-on deployment of the web app (NOT a throwaway dev preview) before
-// building the APK you hand to family.
-def webappUrl = (project.findProperty('WEBAPP_URL') ?: 'http://localhost:3000').toString()
+// property in gradle.properties → (debug only) a localhost default.
+//
+// Release builds FAIL unless WEBAPP_URL is an https URL with a valid host:
+// never ship a release APK pointed at localhost, an HTTP URL, or garbage.
+// Debug builds accept http only for local development hosts.
+def wantsRelease = gradle.startParameter.taskNames.any {
+    it.toLowerCase().contains('release')
+}
+def rawWebappUrl = (project.findProperty('WEBAPP_URL') ?: '').toString().trim()
+
+def validateWebAppUrl(String url, boolean release) {
+    if (url.isEmpty()) {
+        if (release) {
+            throw new GradleException(
+                'WEBAPP_URL is required for release builds — pass -PWEBAPP_URL=https://your-deployment.example'
+            )
+        }
+        return 'http://localhost:3000'
+    }
+    java.net.URI uri
+    try {
+        uri = new java.net.URI(url)
+    } catch (e) {
+        throw new GradleException("WEBAPP_URL '$url' is not a valid URL", e)
+    }
+    def scheme = uri.getScheme()
+    def host = uri.getHost()
+    if (scheme == null || host == null || uri.getRawUserInfo() != null) {
+        throw new GradleException(
+            "WEBAPP_URL '$url' must be an absolute http(s) URL with a host and no embedded credentials"
+        )
+    }
+    def https = scheme.equalsIgnoreCase('https')
+    if (release && !https) {
+        throw new GradleException(
+            "Release builds require an HTTPS WEBAPP_URL — got '$url'. " +
+            'Point it at the public Freebuff deployment; debug builds may use localhost.'
+        )
+    }
+    if (https) return url
+    // Debug http: only local development hosts are acceptable.
+    def hostLc = host.toLowerCase()
+    def devHosts = ['localhost', '127.0.0.1', '10.0.2.2']
+    if (!devHosts.contains(hostLc)) {
+        throw new GradleException(
+            "Debug HTTP WEBAPP_URL '$url' must target a local dev host (${devHosts.join(', ')}). " +
+            'Use an https URL for any real deployment.'
+        )
+    }
+    return url
+}
+def webappUrl = validateWebAppUrl(rawWebappUrl, wantsRelease)
 
 android {
     namespace 'com.familytube'
@@ -76,6 +124,21 @@ android {
         buildConfig true
         viewBinding true
     }
+
+    testOptions {
+        unitTests.all {
+            // AppSecurity is pure JVM; keep default JUnit behaviour.
+            it.useJUnit()
+        }
+    }
+}
+
+tasks.whenTaskAdded { task ->
+    // Fail fast on any release task (assembleRelease, bundleRelease, …)
+    // with a missing/insecure WEBAPP_URL instead of building a bad APK.
+    if (task.name.toLowerCase().contains('release')) {
+        validateWebAppUrl(rawWebappUrl, true)
+    }
 }
 
 dependencies {
@@ -83,4 +146,6 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.webkit:webkit:1.9.0'
     implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+
+    testImplementation 'junit:junit:4.13.2'
 }

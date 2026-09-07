@@ -1,289 +1,278 @@
-# Experiment-1
+# Experiment-1 — household YouTube client shell (Freebuff Cloud)
 
-A YouTube **client shell** for a family in Iran with slow (1–2 Mbps) internet:
-a Persian (Farsi), RTL, YouTube-Android-look-alike web app whose backend
-proxies YouTube metadata, thumbnails, and video streams (byte-relayed through
-the server, with Range/seek support) so the family can watch YouTube without
-YouTube being reachable from their network.
+A private, single-household Persian (Farsi, RTL) YouTube-style client for
+very slow (1–2 Mbps) internet. The Node backend proxies YouTube metadata,
+thumbnails and video streams (byte-relayed with full Range/seek support) so
+the household never touches YouTube hosts directly; the Android WebView
+wrapper turns it into an installable app.
 
 > **Honest caveats before you build on this:**
-> - Re-serving YouTube content through your own proxy can violate
->   [YouTube's Terms of Service](https://www.youtube.com/t/terms). Keep this a
->   private tool for your own household — do not host it publicly or for
->   third parties, and never re-distribute/downloaded content.
-> - The **server must run on a host with unrestricted access to YouTube**
->   (e.g. a cheap VPS outside Iran). Iranian ISPs block YouTube, so a server
->   hosted in Iran cannot fetch anything.
-> - YouTube actively blocks datacenter IP ranges. If metadata extraction
->   starts failing with `Sign in to confirm you're not a bot`, you may need a
->   residential egress or authenticated yt-dlp cookies.
-> - `ffmpeg` + `yt-dlp` are required on the server (the Dockerfile installs
->   both). This repo intentionally calls `yt-dlp` as a **system binary**, not
->   an npm package.
+> - Re-serving YouTube content through your own proxy may violate
+>   [YouTube's Terms of Service](https://www.youtube.com/t/terms). Keep this
+>   a private household tool. Do not host it publicly.
+> - The server must run on a host with unrestricted access to YouTube
+>   (outside Iran). Iranian ISPs block YouTube.
+> - YouTube actively blocks datacenter IP ranges. If that happens, no amount
+>   of retries fixes it — see “The three networks” below.
+
+## Runtime baseline (read this first)
+
+- **Node.js ≥ 22** is the supported production runtime (`engines` in
+  `package.json`, enforced at startup). Node 20 is **not** supported.
+- **yt-dlp runs as a standalone official binary** pinned in one place
+  (`src/config/ytdlp-version.json`), verified by SHA-256, stored under the
+  gitignored `.runtime/bin/` directory. No pip, no Python, no ffmpeg and no
+  Chromium are needed: the app selects a single progressive media URL and
+  byte-relays it, and yt-dlp’s JavaScript-challenge (EJS) support runs on
+  Node 22 itself via `--js-runtimes node` in the centralized runner.
+- Resolution order for the yt-dlp executable:
+  1. `YT_DLP_PATH` (explicit operator override),
+  2. `.runtime/bin/yt-dlp` (repository-local, bootstrapped),
+  3. `yt-dlp` on `PATH`.
+- `npm run bootstrap:runtime` downloads the pinned release (architecture
+  aware: `yt-dlp_linux` / `yt-dlp_linux_aarch64`), verifies its SHA-256
+  against the official release checksum file, and installs it under
+  `.runtime/bin/`. It is idempotent: a second run never re-downloads a
+  valid installed binary. `npm start` runs `prestart` (an idempotent
+  runtime verification) before booting.
+- To **update yt-dlp deliberately**: bump `defaultVersion` in
+  `src/config/ytdlp-version.json`, then run
+  `npm run bootstrap:runtime -- --force` and re-run the verification suite.
+- If the runtime cannot be established, readiness fails with a precise
+  `RUNTIME_MISSING` reason — user requests never die with a later ENOENT.
 
 ## Stack
 
-- **Backend:** Node.js 20+, [Hono](https://hono.dev), TypeScript (ESM, NodeNext)
-- **Extraction:** `yt-dlp` (system binary) + `ffmpeg`
-- **Frontend:** static HTML/CSS/JS (no framework) — Persian, RTL, YouTube dark theme
-- **Deploy:** Docker / docker-compose
-- **Offline:** service worker (app shell + thumbnails/feeds/search) plus
-  IndexedDB-backed «دانلود برای تماشای آفلاین» downloads; see PLAN.md
-- **Android:** Gradle-built WebView wrapper (API 26+, no Android Studio) that
-  loads this app as a full-screen «ویدیو» app — back-button history, Persian
-  offline page, native share, JS bridge; see `android/README.md`
-
-## Project structure
-
-```
-├── src/
-│   ├── index.ts                 # Hono server entry
-│   ├── config.ts                # env-driven config
-│   ├── types/                   # video + api types
-│   ├── middleware/              # cache / streamCache / rateLimit / errorHandler
-│   ├── services/
-│   │   ├── youtube/             # extractor, searchService, streamProxy
-│   │   └── cache/               # in-memory TTL cache singleton
-│   ├── routes/                  # video, search, stream, health + aggregator
-│   ├── utils/                   # ytDlp, httpUtils, logger, urlValidator
-│   └── frontend/                # Persian RTL UI (HTML/CSS/JS)
-├── android/                     # native Android WebView wrapper (see android/README.md)
-├── Dockerfile / docker-compose.yml
-└── .env.example                 # see "Environment" below
-```
+- **Backend:** Node 22, Hono, TypeScript (ESM, NodeNext).
+- **Frontend:** plain HTML/CSS/JS (ES modules, no framework), Persian RTL.
+  Fonts (Vazirmatn) and icons (Material Icons Round) are **self-hosted** —
+  no Google Fonts, no Material CDN, no external analytics or CDNs are
+  required for the critical UI.
+- **Extraction:** yt-dlp (pinned standalone binary, Node 22 EJS runtime)
+  through one bounded runner — every subprocess goes through a concurrency
+  gate with single-flight deduplication.
+- **Offline:** service worker (app-shell + allowlisted cache) plus
+  IndexedDB chunked/resumable downloads.
+- **Android:** Gradle WebView wrapper (`android/`).
 
 ## Quick start
 
-### With Docker (recommended — installs yt-dlp + ffmpeg)
+### Freebuff Cloud (primary deployment target)
+
+1. Clone the repository; Freebuff installs dependencies from the lockfile
+   and runs the repo’s own scripts (`npm ci`, build, start). `prestart`
+   bootstraps/verifies the pinned yt-dlp runtime automatically.
+2. Set the environment variables listed below in the platform env UI
+   (Settings → Keys / Environment). Production requires at least
+   `ACCESS_KEY` + `SESSION_SECRET`; the process **fails closed** when they
+   are missing.
+3. `PORT` is injected by the platform; the server binds `HOST` (default
+   `0.0.0.0`).
 
 ```bash
-cp .env.example .env      # create once, tune settings
-docker compose up --build
-# http://localhost:3000  → Persian UI
-# http://localhost:3000/api/health
+npm ci
+npm run bootstrap:runtime   # idempotent; prestart does this automatically
+npm run build
+npm start                   # prestart verifies the runtime first
 ```
 
-### Local development
+### Docker (secondary deployment route)
 
-Requires Node 20+ and `yt-dlp` + `ffmpeg` on PATH.
+The image uses the *same* runtime strategy as Freebuff (Node 22 +
+`npm ci` + the pinned standalone yt-dlp bootstrap) — not a parallel pip
+environment. Health checks honor `$PORT`.
 
 ```bash
-npm install
-npm run dev        # tsx watch → http://localhost:3000
-# or:
-npm run build && npm start
+ACCESS_KEY=… SESSION_SECRET=… docker compose up --build
 ```
 
-Verify: `GET /api/health` returns `200 {"status":"ok",...}` and `GET /`
-serves the RTL Persian UI. `GET /api/health/ready` reports whether yt-dlp is
-installed.
+## Authentication & access control
 
-## API
+The old design (a public `/api/config` that handed out the API key, keys in
+`?key=…` query strings) is gone.
 
-| Endpoint | Description |
-| --- | --- |
-| `GET /api/health` | liveness + memory (**public**) |
-| `GET /api/health/ready` | readiness incl. yt-dlp check (**public**) |
-| `GET /api/config` | bootstrap config — hands the frontend its API key (**public**) |
-| `GET /api/search?q=...&max=8` | search results (yt-dlp `ytsearch`) |
-| `GET /api/video/:id?quality=240` | video metadata (cached 2 h) |
-| `GET /api/video/:id/thumbnail` | proxied thumbnail (i.ytimg.com relay; **public** — `<img>` tags can't send a key header) |
-| `GET /api/stream/:id?quality=240` | **byte-relayed video stream** (Range/206, HEAD) |
-| `GET /api/stream/:id/probe` | lightweight availability check |
-| `GET /api/stream/stats` | stream-cache statistics |
-| `GET /api/feed/home?page=&limit=` | mixed trending home feed |
-| `GET /api/feed/category/:id?page=&limit=` | category feed (music, news, …) |
-| `GET /api/feed/categories` | category list with Persian labels |
-| `GET /api/feed/stats` | feed-cache statistics |
-| `GET /api/diag/pipeline` | full yt-dlp → googlevideo.com → relay pipeline test |
-| `GET /api/diag/ip` | egress IP + datacenter detection |
-| `GET /api/diag/ytdlp-verbose` | raw verbose yt-dlp log (bot-wall diagnosis) |
-| `GET /api/diag/stream-test` | round-trip through `/api/stream` |
-| `GET /api/diag/blocking-status` | active YouTube block type |
-| `GET /api/diag/workaround-extract` | workaround ladder for one video |
-| `GET /api/diag/potoken` | PO-token provider status + token preview |
-| `GET /api/diag/report` | combined diagnostic report + verdict |
-| `GET /api/diag/sandbox` | keepalive / bandwidth / sandbox health |
+- `POST /api/session` with the household `ACCESS_KEY` in a JSON body
+  (constant-time comparison) issues a signed **HttpOnly** cookie:
+  `SameSite=Strict`, `Path=/`, `Secure` in production, default 30-day
+  lifetime (`SESSION_TTL_DAYS`). The cookie value carries an expiry and is
+  HMAC-signed with `SESSION_SECRET`.
+- Same-origin `<img>`/`<video>`/fetch requests carry the cookie
+  automatically, so no secret ever appears in JavaScript, a URL, logs or
+  history.
+- `GET /api/session` reports only `{authenticated, authMode}` — never a
+  secret. `DELETE /api/session` revokes the token server-side **and**
+  expires the cookie.
+- **Public by design:** liveness/readiness health endpoints and the
+  session lifecycle. Everything else (`/api/search`, feeds, metadata,
+  thumbnails, streams, stats, diagnostics) requires a session. In
+  production, missing `ACCESS_KEY`/`SESSION_SECRET` aborts startup.
+  `AUTH_DISABLED=true` is the only sanctioned development escape hatch and
+  is refused in production.
+- Rate limiting is mounted by class (login attempts: very low; metadata/
+  feeds: moderate; extraction-triggering calls: low; diagnostics:
+  extremely low) and returns accurate `Retry-After` values. Client
+  identity never blindly trusts `X-Forwarded-For`: it is used only when
+  `TRUST_PROXY=true`, and expensive work keys on session identity where a
+  session exists.
 
-Home/category feeds are yt-dlp searches cached for 30 minutes (there is no
-real “trending” endpoint without the YouTube API), and their thumbnails go
-through the same proxy route as search results. The Home tab, category
-chips, infinite scroll, search history, subscriptions and the library
-(history / watch-later / liked / offline downloads) are all driven by this
-API plus localStorage/IndexedDB — see PLAN.md for the phase-by-phase
-status.
+## Streaming correctness & safety
 
-All traffic to YouTube (metadata, thumbnails, streams) goes through the
-backend, so Iranian clients never touch YouTube hosts directly. The stream
-endpoint relays bytes from googlevideo.com: seeking is supported (Range
-requests pass through → `206 Partial Content`), direct URLs are cached for
-2 hours and never exposed to clients, and a blocked/expired URL triggers one
-cache-invalidating re-extraction before failing.
+- `Range` handling distinguishes **absent / valid / invalid**; a malformed
+  or multi-range request is rejected (416 where applicable, with
+  `Content-Range: bytes */TOTAL`) instead of silently becoming a full
+  download. Suffix ranges (`bytes=-500`) are forwarded correctly.
+- Every outbound media request validates the host allowlist, is manually
+  redirected (max 5 hops) with **every hop re-validated**, requires HTTPS,
+  and rejects embedded credentials. Probes, relays and diagnostics share
+  this same safe transport.
+- Responses use `Cache-Control: private, no-transform` semantics — never
+  `public`, and no wildcard CORS (frontend and API are same-origin).
+- Cached signed media URLs respect their `expire` parameter minus a safety
+  margin (`STREAM_CACHE_EXPIRY_MARGIN_MS`); an expired signed URL triggers
+  one cache-invalidating re-extraction, but a genuine YouTube 429 never
+  triggers re-extraction storms.
+- Request cancellation propagates upstream (phone disconnects → upstream
+  fetch aborted).
 
-The server also runs a keepalive every 4 minutes — an internal `/api/health`
-self-ping **and** an external ping (`api.ipify.org`, overridable with
-`KEEPALIVE_EXTERNAL_URL`) that generates real egress traffic so idle
-FreeBuff-style sandboxes stay awake — and tracks bandwidth/slow requests;
-snapshot them at `/api/diag/sandbox`. See “Security” below and the keepalive
-alternatives in `PLAN.md` for always-on VPS deployments.
+## Feeds & search
 
-## Security
+- Categories are configured **semantically** (query text + sort mode +
+  batch size) and the yt-dlp search string is generated in one function
+  (`ytsearchdateN:` for fresh content, `ytsearchN:` otherwise). No
+  year-pinned queries (the old `"popular music 2024"` is gone) and no
+  fragile query-string rewriting.
+- One bounded batch (default 50) is fetched per category, cached 15–20
+  minutes, and pages are served by slicing it — `hasMore` is honest and a
+  page beyond the batch is empty (never a silent fallback to page 1).
+- Stale-if-error: a temporary YouTube failure serves the last successful
+  batch instead of blanking the UI.
 
-### API key authentication
+## Expensive work is bounded
 
-Every `/api/*` endpoint except the small public set (liveness/readiness,
-`/api/config`, and proxied thumbnails) requires an API key. Set it via
-environment variable:
+All yt-dlp subprocesses run through one concurrency gate
+(`YT_DLP_CONCURRENCY`, default 2) with a bounded queue, queue/subprocess
+timeouts, cancellation, single-flight deduplication, graceful shutdown,
+and queue-full → `503` + `Retry-After`. Failures are classified
+(content-not-found, private/restricted, geo, DRM, live, format-unavailable,
+bot detection, 429 rate limit, CDN 403, DNS, timeouts, malformed output,
+missing runtime) — the requested-format-unavailable error is *not* treated
+as bot detection, permanent failures are never blindly retried, and a real
+429 is never “fixed” by spawning more extraction.
 
-```bash
-export API_KEY=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+## Diagnostics & health
+
+- `GET /api/health/live` — cheapest possible process-liveness check.
+- `GET /api/health/ready` — cached (45 s) local prerequisite check:
+  configuration valid, Node ≥ 22, yt-dlp resolves and runs, JS runtime
+  supported. Returns 503 with a precise reason when the runtime is missing.
+  It never performs a YouTube extraction — readiness ≠ YouTube reachability.
+- `GET /api/diag/*` are **disabled by default** (`ENABLE_DIAGNOSTICS=false`
+  → 404). When enabled they require a session, an extremely strict rate
+  limit, a single-flight deep-test lock, finite timeouts, and redact all
+  tokens/cookies/proxy credentials/signed URLs. Diagnostics never call the
+  server’s own HTTP API and never reconfigure host networking (no WARP).
+
+### The three networks
+
+Failures are handled independently and never blurred together:
+
+| Failure | Meaning | Action |
+| --- | --- | --- |
+| runtime not ready | yt-dlp/JS runtime missing on the server | `npm run bootstrap:runtime`; readiness reports `RUNTIME_MISSING` |
+| YouTube extraction blocked | Freebuff’s egress IP is rejected (`Sign in to confirm you’re not a bot`, 429/403) | External egress problem — different controlled egress (see below); retries cannot fix a blocked IP |
+| CDN blocked | metadata works but Google Video CDN rejects byte fetches | Same class of external egress issue, reported separately |
+| client can’t reach Freebuff | the phone/browser cannot reach the Freebuff host | Ingress/network problem on the client side, not a YouTube problem |
+
+An optional operator-controlled outbound proxy (`YT_PROXY_URL`) routes
+**both** yt-dlp extraction traffic and Node media/CDN fetches through the
+same egress. It is never derived from user input and its credentials are
+never logged. If the deployed Freebuff egress is persistently blocked, the
+correct operational conclusion is “application code healthy — egress
+blocked by YouTube”, which the smoke test reports as such.
+
+## Environment variables
+
+Secrets are marked 🔒 — set them in the platform env UI / deployment env;
+**never commit them**. All keys are read from `process.env` at startup.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NODE_ENV` | `development` | `production` enables fail-closed auth and `Secure` cookies |
+| `PORT` | `3000` | listen port (Freebuff injects it) |
+| `HOST` | `0.0.0.0` | listen host |
+| `ACCESS_KEY` 🔒 | – | household access key (required in production) |
+| `SESSION_SECRET` 🔒 | – | HMAC signing secret, ≥ 16 chars (required in production) |
+| `AUTH_DISABLED` | `false` | explicit dev-only auth bypass (refused in production) |
+| `SESSION_TTL_DAYS` | `30` | household cookie lifetime |
+| `TRUST_PROXY` | `false` | trust `X-Forwarded-For`/`X-Real-IP` for rate-limit keys |
+| `LOGIN_MAX_REQUESTS` / `LOGIN_WINDOW_MS` | `8` / `15 min` | login attempt limits |
+| `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW` | `120` / `60 s` | ordinary API calls |
+| `EXTRACT_MAX_REQUESTS` / `EXTRACT_WINDOW_MS` | `20` / `60 s` | extraction-triggering calls |
+| `DIAG_MAX_REQUESTS` / `DIAG_WINDOW_MS` | `4` / `10 min` | diagnostics |
+| `YT_DLP_VERSION` | pinned default | override of the single-source version pin |
+| `YT_DLP_PATH` | – | explicit trusted yt-dlp binary path |
+| `YT_DLP_CONCURRENCY` | `2` | max simultaneous yt-dlp processes |
+| `YT_DLP_QUEUE_MAX` | `24` | max waiting jobs before `503` |
+| `YT_DLP_QUEUE_TIMEOUT_MS` | `45000` | max queue wait |
+| `YT_DLP_PROCESS_TIMEOUT_MS` | `90000` | per-process timeout |
+| `YT_PLAYER_CLIENTS` | – | advanced: allowlisted forced player clients (comma list; empty = yt-dlp defaults) |
+| `YT_EXTRACTOR_ARGS` 🔒 | – | advanced: raw `--extractor-args youtube:…` (e.g. temporary PO-token workarounds); never logged |
+| `YT_PROXY_URL` 🔒 | – | operator outbound proxy for all YouTube/CDN egress |
+| `UPSTREAM_CONNECT_TIMEOUT_MS` / `UPSTREAM_READ_TIMEOUT_MS` | `15000` / `30000` | outbound fetch timeouts |
+| `UPSTREAM_MAX_REDIRECTS` | `5` | safe redirect hop limit |
+| `STREAM_CACHE_TTL_MS` / `STREAM_CACHE_EXPIRY_MARGIN_MS` | `2 h` / `5 min` | signed-URL cache policy |
+| `SEARCH_CACHE_TTL_MS` | `3 min` | search cache (household-friendly) |
+| `CACHE_MAX_VIDEO` / `CACHE_MAX_SEARCH` | `200` / `100` | cache bounds |
+| `FEED_BATCH_SIZE` / `FEED_TTL_MS` | `50` / `20 min` | per-category batch policy |
+| `HOME_FEED_BATCH_SIZE` / `HOME_FEED_TTL_MS` | `48` / `15 min` | home feed batch policy |
+| `ENABLE_DIAGNOSTICS` | `false` | expose `/api/diag/*` (authenticated) |
+| `KEEPALIVE_ENABLED` / `KEEPALIVE_INTERVAL_MINUTES` | `false` / `4` | optional, unref’d self-ping experiment — not guaranteed to prevent sandbox suspension |
+| `LOG_LEVEL` | `info` | `debug` enables verbose server-side logs (never secrets) |
+
+## Testing & verification
+
+- `npm run lint` — ESLint (no-undef etc.) over the frontend.
+- `npm test` — the real Vitest suite (Range parsing/resolution, session
+  auth incl. tamper/expiry/logout revocation, URL allowlist + redirect
+  re-validation, strict numeric validation, feed batch pagination,
+  yt-dlp failure classification, concurrency gate, config fail-closed).
+- `npm run build` / `npm run typecheck`.
+- **`scripts/smoke.mjs`** — external smoke test against a *deployed*
+  Freebuff URL. The access key must be passed via `FREEBUFF_SMOKE_KEY`
+  (environment variable — never an argument):
+  ```bash
+  FREEBUFF_SMOKE_KEY=… node scripts/smoke.mjs "https://your-freebuff-url.app"
+  ```
+  It verifies shell/liveness/readiness/auth/search/metadata/thumbnails,
+  exact byte ranges (first, mid-file, suffix, malformed → 416,
+  unsatisfiable → 416 `bytes */TOTAL`), no signed-URL leakage, and
+  diagnostics-off-by-default, and reports distinct failure categories
+  (`freebuff_ingress`, `auth`, `runtime_missing`, `extraction_blocked`,
+  `cdn_blocked`, `range_corruption`, `timeout`). Running it against
+  `localhost` proves only the local process — the real ingress, Range
+  survival through the reverse proxy, and phone/Iran reachability are
+  separate checks to run against the live preview URL (see TESTING.md).
+
+## Structure
+
+```
+src/
+  index.ts               # server entry (security headers, routing, shutdown)
+  config.ts              # env config (fail-closed validation)
+  config/ytdlp-version.json  # single yt-dlp version pin
+  middleware/            # session auth, rate limiting, stream cache/counters
+  routes/                # session, search, feed, video, stream, health, diag
+  services/
+    ytdlp/               # runtime resolution + bounded runner (queue, errors)
+    youtube/             # extractor, feeds/search, stream proxy
+    cache/               # bounded TTL + stale-if-error caches
+    diagnostics.ts / egress.ts
+  utils/                 # range parsing, URL allowlist, outbound net, params
+  frontend/              # Persian RTL UI (self-hosted fonts/icons)
+android/                 # WebView wrapper (see android/README.md)
+scripts/                 # runtime bootstrap + smoke test
+tests/                   # Vitest suite
 ```
 
-The key may be sent as `X-API-Key: <key>`, `Authorization: Bearer <key>`, or
-`?key=<key>` (the `<video>` element uses the query param). The frontend
-fetches the key from `/api/config` on first load or shows a Persian prompt
-when a request is unauthorized — no manual header configuration needed.
-
-- **Without `API_KEY` set the server warns once and runs in insecure dev
-  mode** (auth disabled) so local/preview work is frictionless. Set the key
-  in the platform env UI before serving real users.
-- **Protected:** video proxy (`/api/stream`), search/feed/video metadata,
-  and **all `/api/diag/*` endpoints** — these expose server infrastructure
-  details (IP, hosting provider, bandwidth, PO-token state) and must never
-  be reachable without a key.
-- **Public by design:** `/api/health`, `/api/health/ready`, `/api/config`
-  (frontend bootstrap), and `/api/video/:id/thumbnail` (rendered by `<img>`
-  tags, which cannot send headers).
-
-### PO token
-
-For datacenter-IP deployments, PO tokens are often the difference between
-extraction working and `Sign in to confirm you're not a bot`. The image
-includes the bgutil provider + plugin and the app auto-generates/refreshes
-tokens; see **[POTOKEN.md](POTOKEN.md)** for setup and troubleshooting.
-
-### Quality selector
-
-The watch page gear button lets viewers pick 144p / 240p (recommended) /
-360p / 480p; the choice is remembered per device and the video reloads at
-the new quality immediately.
-
-### Live testing & failure diagnosis
-
-Before trusting this in front of the family, validate the deployment against
-real YouTube: follow **`TESTING.md`** top to bottom. The `/api/diag/*`
-endpoints (see the API table) isolate exactly where the pipeline breaks —
-extraction blocked (bot-wall/429/403), video-CDN blocked, or network — and
-`/api/diag/workaround-extract` runs the fallback ladder — client rotation
-→ explicit android/mweb attempts (`src/services/youtube/blockingWorkaround.ts`;
-Cloudflare WARP was removed because the image does not install `warp-cli`).
-Expect YouTube to block plain datacenter IPs; that is the #1 known failure
-mode for FreeBuff-style hosting — see POTOKEN.md before falling back to
-Plan B egress.
-
-`quality` is a *maximum*: the extractor picks the highest combined
-(audio+video) MP4/WebM ≤ that height, or the smallest one above it when
-nothing lower exists (YouTube rarely serves combined files under 360p, so
-requests for 144/240p usually stream 360p MP4 — ideal for 1–2 Mbps links).
-Valid values: `144`, `240`, `360`, `480`.
-
-## Environment
-
-`.env.example` (create `.env` from it; never commit real `.env`):
-
-```ini
-# Server Configuration
-PORT=3000
-NODE_ENV=production
-
-# Critical Security — generate with:
-#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-# Unset = insecure dev mode (auth disabled + startup warning).
-API_KEY=
-
-# Cache Settings
-CACHE_TTL_VIDEO=7200000
-CACHE_TTL_SEARCH=30000
-CACHE_MAX_VIDEO=200
-CACHE_MAX_SEARCH=100
-
-# Rate Limiting
-RATE_LIMIT_WINDOW=60000
-RATE_LIMIT_MAX_REQUESTS=30
-
-# Video Quality Settings
-DEFAULT_VIDEO_HEIGHT=240
-MAX_VIDEO_HEIGHT=480
-
-# Logging
-LOG_LEVEL=info
-
-# CORS
-CORS_ORIGIN=*
-
-# PO tokens (Proof of Origin) to bypass YouTube's datacenter-IP bot-wall.
-# Preferred: leave empty — the bgutil provider auto-generates (POTOKEN.md).
-# Manual override pair:
-YT_PO_TOKEN=
-YT_VISITOR_DATA=
-# bgutil HTTP provider URL (auto-spawned at 127.0.0.1:4416 when default).
-YT_PO_PROVIDER_URL=http://127.0.0.1:4416
-
-# Keepalive external ping target (egress traffic for idle sandboxes).
-KEEPALIVE_EXTERNAL_URL=https://api.ipify.org
-```
-
-`.env.example` cannot be committed in this workspace; the platform env UI
-accepts the same keys.
-
-## Offline / low bandwidth
-
-- A **service worker** (`src/frontend/sw.js`) is registered automatically
-  (best-effort — unsupported browsers/webviews simply stay online-only). It
-  makes the app shell usable offline after the first visit and serves
-  already-seen thumbnails and feed/search results instantly from cache
-  while refreshing them in the background. Video streams are never stored
-  by the service worker (Range/206 + large files).
-- **Watch-later downloads**: the ⋮ menu of any video (and the watch-page
-  «دانلود» button) offers «دانلود برای تماشای آفلاین», which downloads the
-  same 240p-max stream the player uses and stores it in IndexedDB. Progress
-  is shown in the Library → «آفلاین» section, downloads can be cancelled,
-  and finished videos play fully offline from a local Blob.
-- Service workers require a secure context (`https://`, or localhost).
-
-## Android app (native wrapper)
-
-`android/` is a small Gradle project (Kotlin, API 26+, ~3 MB APK) wrapping
-this web app in a full-screen WebView — a real home-screen app for
-non-technical family members instead of a browser bookmark. It is built from
-the command line (no Android Studio) and only needs a JDK 17 + Android SDK:
-
-```bash
-cd android
-./gradlew assembleDebug -PWEBAPP_URL="https://your-server.example"
-# → android/app/build/outputs/apk/debug/app-debug.apk  (installable)
-```
-
-- The **web app URL is baked into the APK** at build time via the
-  `WEBAPP_URL` Gradle property (point it at the public deployment, not a
-  dev preview).
-- Back button walks the WebView history; offline shows a Persian
-  «اینترنت قطع است» page that retries and auto-reloads on reconnect.
-- The page detects the wrapper through `window.AndroidWrapper` +
-  `android-wrapper-ready` (`src/frontend/js/utils/nativeApp.js`) and shares
-  via the native sheet.
-- Caveat: Android WebView does **not** support service workers, so `sw.js`
-  shell caching is inactive there — IndexedDB offline downloads still work.
-
-Full build/signing/install/update instructions: [`android/README.md`](android/README.md).
-
-## UI notes
-
-- Persian UI strings and RTL layout are baked into `src/frontend/`
-  (`index.html`, `styles/rtl.css`, `js/utils/persianUtils.js`).
-- Persian numerals: durations, view/subscriber counts and timestamps render as
-  `۰۱۲۳…`.
-- Fonts currently load from Google Fonts; for Iran, self-host Vazirmatn
-  (see `src/frontend/assets/fonts/README.md`).
-- Design tokens mirror YouTube's Android dark theme
-  (`styles/youtube-theme.css`).
+See **TESTING.md** for the ordered validation guide and **android/README.md**
+for building the wrapper.

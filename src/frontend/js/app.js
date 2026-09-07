@@ -151,10 +151,14 @@ function registerServiceWorker() {
 }
 
 function registerSw() {
-    navigator.serviceWorker.register('sw.js').catch((error) => {
-        // Not fatal — the app runs fine without a service worker.
-        console.warn('[sw] registration failed:', error);
-    });
+    // Module worker: sw.js imports the shared caching policy from
+    // js/sw-policy.js. Unsupported browsers reject the promise and the app
+    // simply stays online-only — never fatal.
+    navigator.serviceWorker
+        .register('sw.js', { type: 'module' })
+        .catch((error) => {
+            console.warn('[sw] registration failed:', error);
+        });
 }
 
 /** Shorts shelf needs a data source (later phase); show a friendly stub. */

@@ -1,24 +1,35 @@
 {
   "name": "experiment-1",
   "version": "1.0.0",
-  "description": "YouTube proxy for Iran - YouTube UI clone in Persian",
+  "description": "Persian household YouTube proxy — RTL client, proxied metadata/thumbnails/streams, offline downloads, Android wrapper",
   "main": "dist/index.js",
   "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "typecheck": "tsc -b --noEmit",
     "start": "node dist/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "bootstrap:runtime": "node scripts/bootstrap-runtime.mjs",
+    "prestart": "node scripts/ensure-runtime.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/frontend --max-warnings=0",
+    "lint:all": "npm run lint && npm run typecheck",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "@hono/node-server": "^1.8.0",
-    "@hono/zod-validator": "^0.2.0",
     "hono": "^4.0.0",
-    "zod": "^3.22.0"
+    "undici": "^6.21.0"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "vitest": "^3.0.0"
   }
 }

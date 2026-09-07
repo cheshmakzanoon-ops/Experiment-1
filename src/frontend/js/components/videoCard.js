@@ -4,8 +4,9 @@
 
 import { formatViewCount, formatDuration } from '../utils/persianUtils.js';
 import { showToast, el, icon } from '../utils/domUtils.js';
-import { getNativeBridge } from '../utils/nativeApp.js';
+import { shareVideo } from '../utils/videoActions.js';
 import { showActionSheet } from './actionSheet.js';
+import { openVideoPlayer } from './videoPlayer.js';
 import {
     addToWatchLater,
     markNotInterested
@@ -176,6 +177,12 @@ async function showVideoMenu(videoData, card) {
                 showToast('دانلود لغو شد');
             }
         });
+    } else if (download && download.status === 'paused') {
+        items.push({
+            icon: 'download',
+            label: 'ادامه دانلود',
+            onClick: () => startOfflineDownload(videoData)
+        });
     } else if (offlineSupported()) {
         items.push({
             icon: 'download',
@@ -212,11 +219,17 @@ async function showVideoMenu(videoData, card) {
     showActionSheet({ title: videoData.title || '', items });
 }
 
-/** Begin an offline download from the card menu. */
+/** Begin (or resume) an offline download from the card menu. */
 async function startOfflineDownload(videoData) {
     try {
-        await startDownload(videoData);
-        showToast('دانلود شروع شد — وضعیت را در کتابخانه ببینید');
+        const result = await startDownload(videoData);
+        if (result && result.status === 'paused') {
+            showToast('دانلود متوقف شد — برای ادامه دوباره لمس کنید');
+        } else if (result && result.status === 'ready') {
+            showToast('دانلود کامل شد');
+        } else {
+            showToast('دانلود شروع شد — وضعیت را در کتابخانه ببینید');
+        }
     } catch (error) {
         if (!error || error.name === 'cancelled') return;
         console.error('[offline] download failed:', error);
@@ -232,31 +245,6 @@ async function playOfflineVideo(videoData) {
         return;
     }
     openVideoPlayer(videoData, { offlineUrl: url });
-}
-
-/**
- * Share a video. Inside the Android wrapper this opens the native share
- * sheet (AndroidBridge.shareVideo); otherwise Web Share API or copy link.
- */
-export function shareVideo(videoData) {
-    const url = `${window.location.origin}/watch?v=${videoData.id}`;
-    const bridge = getNativeBridge();
-    if (bridge && typeof bridge.shareVideo === 'function') {
-        bridge.shareVideo(videoData.title || '', url);
-        return;
-    }
-    if (navigator.share) {
-        navigator
-            .share({ title: videoData.title, url })
-            .catch(() => {});
-    } else if (navigator.clipboard) {
-        navigator.clipboard
-            .writeText(url)
-            .then(() => showToast('لینک کپی شد'))
-            .catch(() => showToast('خطا در کپی لینک'));
-    } else {
-        showToast(videoData.title || '');
-    }
 }
 
 /**

@@ -117,7 +117,8 @@ class MemoryCache {
 // Export singleton instance
 export const memoryCache = new MemoryCache()
 
-// Set up periodic cleanup every 5 minutes
+// Set up periodic cleanup every 5 minutes. `.unref()` so the timer never
+// keeps the process alive in tests or during shutdown.
 setInterval(() => {
   memoryCache.cleanup()
-}, 300000)
+}, 300000).unref()

@@ -1,46 +1,50 @@
 // sw.js — offline / low-bandwidth cache for the Persian YouTube shell.
 //
-// Strategy (for a 1–2 Mbps household connection):
-//   • App shell (html/css/js)          → network-first with cache fallback:
-//     updates arrive on the next load (no stale-code reloads after deploy)
-//     and the shell still works fully offline once visited.
-//   • Thumbnails (/api/video/:id/thumb)→ stale-while-revalidate (they never
-//     change for a video id — a huge saving on slow links).
-//   • Feeds / search / metadata        → stale-while-revalidate: previously
-//     seen content is served instantly (and offline), refreshed in the
-//     background when a connection exists.
-//   • Video streams (/api/stream/...)  → NEVER cached here: they are large,
-//     byte-relayed with Range support (the Cache API breaks Range), and
-//     real offline files go through the IndexedDB download manager instead
-//     (see js/services/offlineService.js).
+// Registered as a **module** worker (`{ type: 'module' }`) so the caching
+// policy below can be shared with the unit tests:
+//   import { ... } from './js/sw-policy.js'
 //
-// Everything is best-effort: if registration fails (private browsing, older
-// WebViews, insecure context) the app simply works without a service worker.
+// Strategy (for a 1–2 Mbps household connection):
+//   • App shell (html/css/js/fonts) → network-first with a finite
+//     slow-network timeout (~4 s), then the cached shell. An apparently
+//     connected but unusable network therefore falls back instead of
+//     spinning forever; the next refresh recovers.
+//   • Thumbnails / feeds / search / metadata → stale-while-revalidate,
+//     but ONLY for the explicit API allowlist in js/sw-policy.js.
+//     /api/session, /api/diag/*, /api/health*, /api/stream* and stats
+//     responses are never cached, and no 401/403/429/5xx/no-store body
+//     is ever stored.
+//   • Video streams (/api/stream/...) → NEVER touched here: they are
+//     large, byte-relayed with Range support (the Cache API breaks
+//     Range), and real offline files go through the IndexedDB download
+//     manager instead (see js/services/offlineService.js). The browser's
+//     default same-origin fetch already sends the session cookie.
+//
+// Everything is best-effort: if registration fails (private browsing,
+// older WebViews, insecure context) the app simply works without a
+// service worker.
 
 'use strict';
 
-const VERSION = 'v1';
+import {
+    CORE_PATHS,
+    isNeverCacheablePath,
+    shouldHandleApiRequest,
+    responseIsCacheable
+} from './js/sw-policy.js';
+
+const VERSION = 'v2';
 const CORE_CACHE = `yt-core-${VERSION}`;
 const RUNTIME_CACHE = `yt-runtime-${VERSION}`;
 
-// Static shell assets — always updated by bumping VERSION on deploy.
-const CORE_ASSETS = [
-    '/',
-    '/index.html',
-    '/styles/main.css',
-    '/styles/youtube-theme.css',
-    '/styles/components.css',
-    '/styles/rtl.css',
-    '/js/app.js',
-    '/assets/default-avatar.svg',
-    '/assets/default-channel.svg'
-];
+// Finite slow-network budget for app-shell (navigate/document) requests.
+const SHELL_NETWORK_TIMEOUT_MS = 4000;
 
 self.addEventListener('install', (event) => {
     event.waitUntil(
         caches
             .open(CORE_CACHE)
-            .then((cache) => cache.addAll(CORE_ASSETS))
+            .then((cache) => cache.addAll(CORE_PATHS))
             .then(() => self.skipWaiting())
             .catch(() => {}) // precache failure must not block the SW install
     );
@@ -77,21 +81,34 @@ async function fromCache(request, fallbackPath) {
 
 function cachePut(request, response) {
     // Fire-and-forget: failures (quota, closed cache) are non-fatal.
-    if (!response || !response.ok) return Promise.resolve();
+    if (!responseIsCacheable(response)) return Promise.resolve();
     return caches
         .open(RUNTIME_CACHE)
         .then((cache) => cache.put(request, response.clone()))
         .catch(() => {});
 }
 
-/** Network first, cached copy as the offline fallback (used for pages/assets). */
-function networkFirst(request, fallbackPath) {
-    return fetch(request)
-        .then((response) => {
-            cachePut(request, response);
-            return response;
-        })
-        .catch(() => fromCache(request, fallbackPath));
+/**
+ * Network first with a finite timeout; the cached copy is the fallback.
+ * Used for the app shell so a hung-but-connected network never leaves the
+ * user waiting indefinitely before cache fallback occurs.
+ */
+function networkFirst(request, fallbackPath, timeoutMs = SHELL_NETWORK_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        fetch(request, { signal: controller.signal })
+            .then((response) => {
+                clearTimeout(timer);
+                cachePut(request, response);
+                resolve(response);
+            })
+            .catch(() => {
+                clearTimeout(timer);
+                fromCache(request, fallbackPath).then(resolve);
+            });
+    });
 }
 
 /**
@@ -109,7 +126,7 @@ async function staleWhileRevalidate(request) {
         return cached;
     }
     const fresh = await fetch(request);
-    if (fresh && fresh.ok) cachePut(request, fresh);
+    if (responseIsCacheable(fresh)) cachePut(request, fresh);
     return fresh;
 }
 
@@ -124,31 +141,33 @@ self.addEventListener('fetch', (event) => {
     const url = new URL(request.url);
     if (url.origin !== self.location.origin) return;
 
-    // Pages: always try the network, fall back to the cached shell offline.
+    const path = url.pathname;
+
+    // Pages: try the network (bounded), fall back to the cached shell.
     if (request.mode === 'navigate' || request.destination === 'document') {
         event.respondWith(networkFirst(request, '/index.html'));
         return;
     }
 
-    const path = url.pathname;
+    // Video streams and anything else the policy forbids: let the network
+    // handle it untouched (same-origin cookies still apply).
+    if (path.startsWith('/api/stream')) return;
 
-    // Never touch streams (Range/206 + huge files) or health checks.
-    if (path.startsWith('/api/stream') || path.startsWith('/api/health')) {
-        return;
-    }
-
-    // API responses worth caching (all proxied through this same origin).
+    // API responses: only the explicit allowlist is cached (session,
+    // diagnostics, health, and stats are excluded by the policy).
     if (path.startsWith('/api/')) {
+        if (isNeverCacheablePath(path) || !shouldHandleApiRequest(url)) return;
         event.respondWith(staleWhileRevalidate(request));
         return;
     }
 
     // Static assets of the app shell — network-first so code changes are
     // visible on the very next load; the cached copy serves offline.
-    if (path === '/index.html' || /^\/(styles|js|assets)\//.test(path)) {
+    if (path === '/index.html' || /^\/(styles|js|assets|fonts)\//.test(path)) {
         event.respondWith(networkFirst(request));
         return;
     }
 
-    // Everything else (Google Fonts, etc.) is left to the default fetch.
+    // Everything else is left to the default fetch (no external origins
+    // are needed by this app: fonts/icons are self-hosted).
 });

@@ -10,29 +10,29 @@ import android.webkit.WebViewClient
 import java.io.ByteArrayInputStream
 
 /**
- * WebView client: keeps navigation inside the wrapper (except a short
- * denylist that opens in the real browser), blocks known tracker/ad hosts to
- * save bandwidth on slow links, shows a Persian offline page when the app
- * server is unreachable, and marks the page as running inside the native
- * wrapper once it loads.
+ * WebView client built around a strict application-origin allowlist.
+ *
+ * The ONLY page ever allowed to render inside this WebView (where the
+ * AndroidBridge JS interface stays alive) is the trusted origin derived
+ * from `BuildConfig.WEBAPP_URL`. Everything else is handled like this:
+ *
+ *   • main-frame http(s) URLs on another origin → opened in the system
+ *     browser, never loaded here,
+ *   • sub-frame/iframe navigations off the trusted origin → blocked,
+ *   • `familytube://watch?v=<11-char id>` → handled internally after
+ *     validating the video id against the exact YouTube id shape,
+ *   • unknown/non-web schemes (javascript:, intent:, tel:, …) → rejected,
+ *   • tracker/ad sub-resources → dropped to save bytes on slow links.
+ *
+ * No substring matching is ever used as a trust decision
+ * (no `host.contains("youtube.com")`).
  */
 class FamilyWebViewClient(private val activity: MainActivity) : WebViewClient() {
 
     companion object {
         private const val TAG = "FamilyWebViewClient"
 
-        /** Hosts that should open in the system browser, not our WebView. */
-        private val EXTERNAL_URL_PATTERNS = listOf(
-            "youtube.com",
-            "google.com",
-            "facebook.com",
-            "twitter.com",
-            "instagram.com",
-            "telegram.org",
-            "whatsapp.com"
-        )
-
-        /** Hosts whose requests are blocked to save bytes on slow links. */
+        /** Hosts whose sub-resource requests are blocked to save bytes. */
         private val TRACKING_PATTERNS = listOf(
             "google-analytics.com",
             "googletagmanager.com",
@@ -46,28 +46,58 @@ class FamilyWebViewClient(private val activity: MainActivity) : WebViewClient() 
         )
     }
 
+    /** Normalized trusted origin, e.g. "https://family.example.com". */
+    private val trustedOrigin: String =
+        AppSecurity.originOf(BuildConfig.WEBAPP_URL).orEmpty()
+
     override fun shouldOverrideUrlLoading(
         view: WebView?,
         request: WebResourceRequest?
     ): Boolean {
-        val url = request?.url?.toString() ?: return false
-        Log.d(TAG, "Loading URL: $url")
-
         val uri = request?.url ?: return false
-        val host = uri.host.orEmpty()
+        val url = uri.toString()
+        Log.d(TAG, "shouldOverrideUrlLoading: $url (mainFrame=${request.isForMainFrame})")
 
-        // External sites (real YouTube, social links in descriptions, etc.)
-        // go to the system browser — our WebView only serves the proxy app.
-        val matchesExternal = EXTERNAL_URL_PATTERNS.any { host.contains(it) }
-        if (matchesExternal) {
-            try {
-                activity.startActivity(Intent(Intent.ACTION_VIEW, uri))
-                return true
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to open external URL: $url", e)
+        // familytube://watch?v=VIDEO_ID — our own deep link. The id is
+        // validated before use; anything malformed is dropped silently.
+        if (uri.scheme.equals(AppSecurity.DEEP_LINK_SCHEME, ignoreCase = true)) {
+            if (request.isForMainFrame &&
+                uri.host.equals(AppSecurity.DEEP_LINK_HOST, ignoreCase = true)
+            ) {
+                val videoId = uri.getQueryParameter(AppSecurity.DEEP_LINK_QUERY_KEY)
+                if (AppSecurity.isValidVideoId(videoId)) {
+                    activity.openVideoDeepLink(videoId!!)
+                }
             }
+            return true // never let an unknown familytube: URI navigate the WebView
         }
-        return false
+
+        // Only http(s) URLs are ever candidates for navigation.
+        if (!AppSecurity.isWebScheme(uri.scheme)) {
+            Log.w(TAG, "Blocked non-web scheme navigation: $url")
+            return true
+        }
+
+        // Trusted origin (main frame or sub-frame) stays inside the WebView.
+        if (AppSecurity.isTrustedUrl(url, trustedOrigin)) {
+            return false
+        }
+
+        // Sub-frames may never leave the trusted origin — the bridge must
+        // never become reachable from untrusted content.
+        if (!request.isForMainFrame) {
+            Log.w(TAG, "Blocked off-origin sub-frame navigation: $url")
+            return true
+        }
+
+        // Any other http(s) main-frame URL opens in the system browser.
+        Log.d(TAG, "Opening external URL in system browser: $url")
+        try {
+            activity.startActivity(Intent(Intent.ACTION_VIEW, uri))
+        } catch (e: Exception) {
+            Log.e(TAG, "No handler for external URL: $url", e)
+        }
+        return true
     }
 
     override fun shouldInterceptRequest(
@@ -76,7 +106,9 @@ class FamilyWebViewClient(private val activity: MainActivity) : WebViewClient() 
     ): WebResourceResponse? {
         val url = request?.url?.toString() ?: return null
 
-        // Drop tracker/ad requests outright instead of fetching them.
+        // Drop tracker/ad requests outright instead of fetching them. The
+        // rest of the page is same-origin (fonts/icons are self-hosted and
+        // media is proxied), so nothing legitimate is lost.
         val urlLower = url.lowercase()
         if (TRACKING_PATTERNS.any { urlLower.contains(it) }) {
             return WebResourceResponse(
@@ -86,6 +118,14 @@ class FamilyWebViewClient(private val activity: MainActivity) : WebViewClient() 
             )
         }
         return null
+    }
+
+    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+        super.onPageStarted(view, url, favicon)
+        // Track main-frame trust so the JS bridge can be gated. Sub-frame
+        // starts are never reported here, which is why off-origin frames
+        // are blocked in shouldOverrideUrlLoading instead.
+        activity.onMainFrameUrlChanged(url)
     }
 
     override fun onReceivedError(
@@ -108,6 +148,7 @@ class FamilyWebViewClient(private val activity: MainActivity) : WebViewClient() 
         if (!networkError) return
 
         Log.e(TAG, "Main frame network error $code for ${request.url}")
+        activity.onMainFrameUrlChanged(null)
         loadOfflinePage(view)
     }
 
@@ -162,8 +203,9 @@ class FamilyWebViewClient(private val activity: MainActivity) : WebViewClient() 
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
 
-        // Skip cosmetics for the data: offline fallback page.
-        if (url != null && url.startsWith("data:")) return
+        // Only the trusted application page gets cosmetics + the wrapper
+        // marker (the data: offline fallback and any error page stay bare).
+        if (url == null || !AppSecurity.isTrustedUrl(url, trustedOrigin)) return
 
         // Hide scrollbars — the web app styles its own scrolling surfaces.
         view?.evaluateJavascript(

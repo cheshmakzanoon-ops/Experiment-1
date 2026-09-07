@@ -1,15 +1,17 @@
 /**
  * Cache for extracted stream URLs and their metadata.
  *
- * YouTube's direct googlevideo.com URLs are signed and expire after roughly
- * 6 hours, so the stream URL is cached for 2 hours (well inside the safe
- * window). Metadata is cheap to re-derive from a cached entry but is kept
- * separately so an expired URL does not force a full re-extraction when the
- * frontend just needs a title/duration for the watch page.
+ * YouTube's direct googlevideo.com URLs are signed; a trustworthy `expire`
+ * query parameter (epoch seconds) is honored when present, and the entry is
+ * never cached beyond `expire − STREAM_CACHE_EXPIRY_MARGIN_MS`. Without a
+ * parseable `expire`, a conservative configurable TTL
+ * (STREAM_CACHE_TTL_MS, default 2 h) is used.
  *
  * Keys are `"<videoId>:<maxHeight>"` so quality-specific selections never
  * collide. The cache is bounded (LRU eviction) and pruned on a timer.
  */
+
+import { config } from '../config.js'
 
 export interface StreamSelection {
   url: string
@@ -35,7 +37,7 @@ export interface StreamCacheEntry extends StreamSelection, StreamMeta {
   videoId: string
   maxHeight: number
   extractedAt: number
-  /** When the direct URL expires (must be re-extracted after this). */
+  /** When the direct URL must be considered expired. */
   expiresAt: number
   /** When the whole entry (incl. metadata) expires. */
   metadataExpiresAt: number
@@ -45,24 +47,43 @@ export interface StreamCacheEntry extends StreamSelection, StreamMeta {
 
 type StreamCacheInput = StreamSelection & StreamMeta
 
+/** Parse a trustworthy signed-URL `expire` (epoch seconds) → ms epoch. */
+export function parseSignedExpiry(url: string): number | null {
+  try {
+    const parsed = new URL(url)
+    const raw = parsed.searchParams.get('expire')
+    if (!raw) return null
+    const seconds = Number(raw)
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) return null
+    return seconds * 1000
+  } catch {
+    return null
+  }
+}
+
+const URL_TTL_MS = (): number => config.cache.streamUrlTtlMs
+const EXPIRY_MARGIN_MS = (): number => config.cache.streamExpiryMarginMs
+const METADATA_TTL = 24 * 60 * 60 * 1000
+
 class StreamCache {
   private cache = new Map<string, StreamCacheEntry>()
   private maxSize = 500
   private hits = 0
   private misses = 0
 
-  // TTLs (milliseconds)
-  private static URL_TTL = 2 * 60 * 60 * 1000 // 2 hours (URLs live ~6 h)
-  private static METADATA_TTL = 24 * 60 * 60 * 1000 // 24 hours
-
   private static key(videoId: string, maxHeight: number): string {
     return `${videoId}:${maxHeight}`
   }
 
-  /**
-   * Return a live stream entry for (videoId, maxHeight), or null when the
-   * entry is missing or its direct URL has expired.
-   */
+  /** Live window for a URL: signed expiry − margin, capped by the TTL. */
+  private static urlLifetime(url: string, now: number): number {
+    const signedExpiry = parseSignedExpiry(url)
+    if (signedExpiry !== null) {
+      return Math.max(0, Math.min(URL_TTL_MS(), signedExpiry - EXPIRY_MARGIN_MS() - now))
+    }
+    return URL_TTL_MS()
+  }
+
   get(videoId: string, maxHeight: number): StreamCacheEntry | null {
     const key = StreamCache.key(videoId, maxHeight)
     const entry = this.cache.get(key)
@@ -79,11 +100,6 @@ class StreamCache {
     return entry
   }
 
-  /**
-   * Store (or refresh) a stream entry. If the URL expires later than the
-   * metadata (e.g. a re-extraction after a 403), the metadata TTL is kept
-   * so a re-fetch of the URL does not shorten metadata availability.
-   */
   set(videoId: string, maxHeight: number, data: StreamCacheInput, now: number = Date.now()): void {
     const key = StreamCache.key(videoId, maxHeight)
 
@@ -92,27 +108,22 @@ class StreamCache {
     }
 
     const previous = this.cache.get(key)
-    const metadataExpiresAt = Math.max(
-      now + StreamCache.METADATA_TTL,
-      previous?.metadataExpiresAt || 0
-    )
+    const metadataExpiresAt = Math.max(now + METADATA_TTL, previous?.metadataExpiresAt || 0)
+    const urlLifetime = StreamCache.urlLifetime(data.url, now)
 
     this.cache.set(key, {
       videoId,
       maxHeight,
       ...data,
       extractedAt: now,
-      expiresAt: now + StreamCache.URL_TTL,
+      expiresAt: now + urlLifetime,
       metadataExpiresAt,
       accessCount: previous ? previous.accessCount + 1 : 1,
       lastAccessed: now
     })
   }
 
-  /**
-   * Drop every cached entry for a video (all qualities). Used when an
-   * upstream 403/429 suggests the cached URL went stale or was revoked.
-   */
+  /** Drop every cached entry for a video (all qualities). */
   deleteVideo(videoId: string): void {
     const prefix = `${videoId}:`
     for (const key of this.cache.keys()) {
@@ -125,7 +136,6 @@ class StreamCache {
     this.cache.delete(StreamCache.key(videoId, maxHeight))
   }
 
-  /** Number of entries currently stored. */
   size(): number {
     return this.cache.size
   }
@@ -134,12 +144,6 @@ class StreamCache {
     this.cache.clear()
   }
 
-  /**
-   * Drop entries whose direct URL has expired AND whose metadata window has
-   * passed. Entries with expired URLs but still-valid metadata survive so
-   * the watch page can still render instantly; the stream URL is simply
-   * re-extracted on demand.
-   */
   cleanup(now: number = Date.now()): void {
     for (const [key, entry] of this.cache) {
       if (now > entry.expiresAt && now > entry.metadataExpiresAt) {
@@ -148,7 +152,6 @@ class StreamCache {
     }
   }
 
-  /** Evict the least-recently-used entry when the cache is full. */
   private evictLeastRecentlyUsed(): void {
     let lruKey: string | null = null
     let lruTime = Infinity

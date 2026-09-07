@@ -740,6 +740,115 @@
     color: var(--yt-text-primary);
 }
 
+/* ---- Stream retry affordance ---- */
+.stream-retry-button {
+    margin-top: 10px;
+    padding: 9px 22px;
+    border: none;
+    border-radius: 20px;
+    background: var(--yt-button-secondary, #272727);
+    color: var(--yt-text-primary, #F1F1F1);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.stream-retry-button:active {
+    background: #3F3F3F;
+}
+
+/* ---- Auth gate (access-key session login) ---- */
+.auth-gate {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.86);
+    backdrop-filter: blur(3px);
+    padding: 24px;
+}
+
+.auth-gate__card {
+    background: var(--yt-surface-1, #212121);
+    border-radius: 16px;
+    padding: 28px 24px;
+    width: 100%;
+    max-width: 360px;
+    text-align: center;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.auth-gate__logo {
+    width: 56px;
+    height: 56px;
+    margin: 0 auto 12px;
+    border-radius: 50%;
+    background: var(--yt-button-primary, #FF0000);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+}
+
+.auth-gate__logo .material-icons-round {
+    font-size: 30px;
+}
+
+.auth-gate h1 {
+    font-size: 20px;
+    margin: 0 0 8px;
+    color: var(--yt-text-primary, #F1F1F1);
+}
+
+.auth-gate p {
+    color: var(--yt-text-secondary, #AAAAAA);
+    font-size: 14px;
+    line-height: 1.9;
+    margin: 0 0 16px;
+}
+
+.auth-gate__input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--yt-divider, #303030);
+    background: var(--yt-black, #0F0F0F);
+    color: var(--yt-text-primary, #F1F1F1);
+    font-size: 15px;
+    text-align: left;
+    margin-bottom: 10px;
+    outline: none;
+}
+
+.auth-gate__input:focus {
+    border-color: var(--yt-blue, #3EA6FF);
+}
+
+.auth-gate__error {
+    color: #FF6E6E;
+    font-size: 13px;
+    margin: 0 0 10px;
+}
+
+.auth-gate__submit {
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 24px;
+    background: var(--yt-button-primary, #FF0000);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.auth-gate__submit:disabled {
+    opacity: 0.6;
+}
+
 .library-section-header h2 .material-icons-round {
     font-size: 22px;
     color: var(--yt-text-secondary);
@@ -1018,6 +1127,12 @@
     100% {
         transform: translateX(320%);
     }
+}
+
+.offline-paused-label {
+    font-size: 12px;
+    color: #FFB74D;
+    margin-top: 2px;
 }
 
 .offline-ready-label {

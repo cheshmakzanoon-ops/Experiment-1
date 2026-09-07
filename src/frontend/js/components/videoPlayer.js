@@ -5,16 +5,24 @@
 //   - like / dislike (like is persisted in localStorage)
 //   - share / download
 //   - channel subscribe / unsubscribe (localStorage, no account needed)
+//
+// Playback wiring: the player sets the stream source directly and relies on
+// HTML media events — there is NO range-probe preflight that doubles normal
+// playback traffic. When a real playback error occurs an explicit
+// one-off diagnostic request (Range bytes=0-0) classifies the failure so
+// the Persian message can distinguish offline / server busy / video
+// unavailable / temporary YouTube block, and a retry button re-attaches the
+// stream at the preserved playback position.
 
 import { $, el, showToast } from '../utils/domUtils.js';
 import { formatViewCount } from '../utils/persianUtils.js';
-import { getStreamUrl, apiFetch } from '../api.js';
+import { getStreamUrl, apiFetch, ensureSession, ApiError } from '../api.js';
 import {
     showQualitySelector,
     getPreferredQuality,
     qualityLabel
 } from './qualitySelector.js';
-import { shareVideo } from './videoCard.js';
+import { shareVideo } from '../utils/videoActions.js';
 import {
     addToWatchHistory,
     channelIdFor,
@@ -46,9 +54,9 @@ let playingOffline = false;
 let offlineEventsBound = false;
 
 // --- stall detection state ---------------------------------------------------
-// The server closes upstream reads that stall >30s (streamProxy.ts); here we
-// additionally watch for client-side stalls (no playback progress for 15s)
-// and surface a friendly Persian error instead of infinite buffering.
+// The server closes upstream reads that stall (streamProxy); here we also
+// watch for client-side stalls (no playback progress) and surface a friendly
+// Persian error instead of infinite buffering.
 const STALL_CHECK_INTERVAL_MS = 5000;
 const STALL_TIMEOUT_MS = 15000;
 let stallTimerId = null;
@@ -61,6 +69,18 @@ function stopStallDetection() {
     }
 }
 
+/** Message templates for the classified failure kinds. */
+const STREAM_MESSAGES = {
+    offline: 'اتصال اینترنت برقرار نیست — اتصال را بررسی کنید',
+    timeout: 'سرور دیر پاسخ داد — دوباره تلاش کنید',
+    unauthorized: 'نشست شما معتبر نیست — دوباره وارد شوید',
+    notFound: 'این ویدیو در دسترس نیست',
+    rateLimited: 'سرور شلوغ است — چند لحظه بعد دوباره تلاش کنید',
+    serverUnavailable: 'سرور در دسترس نیست — کمی بعد تلاش کنید',
+    youtubeBlocked: 'یوتیوب موقتاً این درخواست را رد کرد — کمی بعد تلاش کنید',
+    generic: 'پخش این ویدیو در حال حاضر ممکن نیست'
+};
+
 function showStreamError(msg) {
     const notice = $('#streamNotice');
     if (!notice) return;
@@ -68,21 +88,88 @@ function showStreamError(msg) {
     notice.innerHTML =
         '<span class="material-icons-round">play_circle_outline</span>' +
         `<p>${msg}</p>`;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'stream-retry-button';
+    button.textContent = 'تلاش مجدد';
+    button.addEventListener('click', () => retryCurrentStream());
+    notice.appendChild(button);
+}
+
+/** Explicit one-off diagnostic only AFTER a real playback error. */
+async function classifyStreamFailure(streamUrl) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return 'offline';
+    try {
+        const response = await apiFetch(streamUrl, {
+            headers: { Range: 'bytes=0-0' },
+            timeoutMs: 10000
+        });
+        if (response.status === 401) return 'unauthorized';
+        if (response.status === 403) return 'youtubeBlocked';
+        if (response.status === 404) return 'notFound';
+        if (response.status === 429) return 'rateLimited';
+        if (response.status === 502 || response.status === 504) return 'serverUnavailable';
+        if (response.status === 503) return 'rateLimited';
+        if (response.ok || response.status === 206) return 'ok';
+        return 'generic';
+    } catch (error) {
+        if (error instanceof ApiError) {
+            if (error.kind === 'timeout') return 'timeout';
+            if (error.kind === 'unauthorized') return 'unauthorized';
+            if (error.kind === 'rateLimited') return 'rateLimited';
+            if (error.kind === 'serverUnavailable') return 'serverUnavailable';
+            if (error.kind === 'youtubeBlocked') return 'youtubeBlocked';
+            if (error.kind === 'notFound') return 'notFound';
+            if (error.kind === 'offline') return 'offline';
+        }
+        return 'offline';
+    }
+}
+
+// --- retry state -------------------------------------------------------------
+let retryStreamUrl = null;
+let retryDesiredTime = 0;
+let lastRetryAt = 0;
+
+/** Re-attach the stream at the preserved position (bounded retry pacing). */
+async function retryCurrentStream() {
+    const videoPlayer = $('#videoPlayer');
+    const notice = $('#streamNotice');
+    if (!videoPlayer || !retryStreamUrl) return;
+    // Guard against hammering the server right after a failure.
+    if (Date.now() - lastRetryAt < 3000) return;
+    lastRetryAt = Date.now();
+
+    const desiredTime = retryDesiredTime || 0;
+    if (notice) notice.hidden = true;
+    videoPlayer.src = retryStreamUrl;
+    const restorePosition = () => {
+        if (desiredTime > 0 && Number.isFinite(desiredTime) && videoPlayer.readyState >= 1) {
+            try {
+                videoPlayer.currentTime = desiredTime;
+            } catch {
+                /* ignore seek clamp */
+            }
+        }
+        videoPlayer.play().catch(() => {});
+        startStallDetection();
+    };
+    videoPlayer.addEventListener('loadedmetadata', restorePosition, { once: true });
+    videoPlayer.play().catch(() => {});
+    startStallDetection();
 }
 
 function checkForStall() {
     const watchPage = $('#watchPage');
     const videoPlayer = $('#videoPlayer');
-    // Only meaningful for live (online) playback on the visible watch page.
     if (!watchPage || watchPage.style.display === 'none') return;
     if (playingOffline || !videoPlayer) return;
     if (videoPlayer.paused || videoPlayer.ended) return;
 
     if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
-        console.warn('[player] Video stalled for 15s, showing error');
         stopStallDetection();
         videoPlayer.pause();
-        showStreamError('پخش ویدیو متوقف شده است. لطفاً دوباره تلاش کنید.');
+        showStreamError('پخش ویدیو متوقف شده است — دوباره تلاش کنید');
     }
 }
 
@@ -100,11 +187,6 @@ function startStallDetection() {
 
 /**
  * Open the watch page for a video-like object ({ id, title, ... }).
- *
- * Metadata renders immediately; playback is wired after a successful probe
- * of the /api/stream proxy (200/206 for a Range request). Failures — a
- * 404/429/501 or a mid-playback error — show a friendly Persian notice
- * instead of a dead <video>.
  */
 export async function openVideoPlayer(videoData, options = {}) {
     const watchPage = $('#watchPage');
@@ -119,11 +201,9 @@ export async function openVideoPlayer(videoData, options = {}) {
     const description = $('#videoDescription');
     const notice = $('#streamNotice');
 
-    // Remember what is open so the download button / events can react.
     currentVideoData = videoData;
     playingOffline = !!options.offlineUrl;
 
-    // Show the page + metadata first so it feels instant on slow connections.
     watchPage.style.display = 'block';
     mainContent.style.display = 'none';
 
@@ -134,7 +214,6 @@ export async function openVideoPlayer(videoData, options = {}) {
     if (description) description.textContent = videoData.description || '';
     if (notice) notice.hidden = true;
 
-    // --- watch history ---
     addToWatchHistory({
         id: videoData.id,
         title: videoData.title,
@@ -143,69 +222,73 @@ export async function openVideoPlayer(videoData, options = {}) {
         duration: videoData.duration
     });
 
-    // --- channel + subscribe button ---
     setupChannelSection(videoData);
-
-    // --- action buttons (like / dislike / share / download) ---
     setupActionButtons(videoData);
-
-    // --- quality selector (144–480p) ---
     setupQualityButton();
-
-    // Default to the user's preferred quality; the API key travels as a
-    // query param because <video> cannot send request headers.
-    const streamUrl = getStreamUrl(videoData.id, getPreferredQuality());
 
     if (!videoPlayer) return;
 
-    // Surface real playback failures (e.g. the stream dying mid-load), but
-    // stay quiet when the watch page is hidden (e.g. after closing).
+    // Media events drive playback success/failure (no preflight probe).
     videoPlayer.onerror = () => {
         if (watchPage.style.display === 'none') return;
-        showStreamError('پخش این ویدیو در حال حاضر ممکن نیست. لطفاً کمی بعد دوباره تلاش کنید.');
+        handleStreamError();
     };
-
-    // Reset per-open state so a previously failed stream doesn't linger.
     videoPlayer.onplaying = () => {
         if (notice) notice.hidden = true;
         lastProgressAt = Date.now();
     };
 
-    // Play the local copy directly — no probe, no network needed.
     if (options.offlineUrl) {
+        retryStreamUrl = null;
         videoPlayer.src = options.offlineUrl;
-        videoPlayer.play().catch((err) => {
-            console.log('Autoplay prevented:', err);
-        });
+        videoPlayer.play().catch(() => {});
         refreshDownloadButton();
         return;
     }
 
-    // Lightweight preflight: the proxy answers 2xx (200/206) for range
-    // requests. Any other status (404, 429, 501, …) keeps the player clean
-    // and shows a friendly Persian message instead.
-    let playable = false;
-    try {
-        const probe = await apiFetch(streamUrl, {
-            headers: { Range: 'bytes=0-0' }
-        });
-        playable = probe.status === 200 || probe.status === 206;
-    } catch (error) {
-        console.log('Stream probe failed:', error);
-        playable = false;
-    }
-
-    if (playable) {
-        videoPlayer.src = streamUrl;
-        videoPlayer.play().catch((err) => {
-            console.log('Autoplay prevented:', err);
-        });
-        startStallDetection();
-    } else {
-        showStreamError('پخش این ویدیو در حال حاضر ممکن نیست. لطفاً کمی بعد دوباره تلاش کنید.');
-    }
-
+    const streamUrl = getStreamUrl(videoData.id, getPreferredQuality());
+    retryStreamUrl = streamUrl;
+    retryDesiredTime = 0;
+    videoPlayer.src = streamUrl;
+    videoPlayer.play().catch(() => {});
+    startStallDetection();
     refreshDownloadButton();
+}
+
+/** Called from the media error event; classifies and shows a retry option. */
+async function handleStreamError() {
+    const videoPlayer = $('#videoPlayer');
+    const watchPage = $('#watchPage');
+    if (!videoPlayer || !watchPage || watchPage.style.display === 'none') return;
+    stopStallDetection();
+
+    // Preserve the position for the retry affordance.
+    const currentTime = videoPlayer.currentTime;
+    if (Number.isFinite(currentTime) && currentTime > 0) {
+        retryDesiredTime = currentTime;
+    }
+
+    const streamUrl = retryStreamUrl;
+    if (!streamUrl) {
+        showStreamError(STREAM_MESSAGES.generic);
+        return;
+    }
+
+    const kind = await classifyStreamFailure(streamUrl);
+    if (kind === 'unauthorized') {
+        void ensureSession().then(() => {
+            retryCurrentStream();
+        });
+        showStreamError(STREAM_MESSAGES.unauthorized);
+        return;
+    }
+    if (kind === 'ok') {
+        // The server is healthy; a transient drop — offer an automatic
+        // single retry at the preserved position.
+        retryCurrentStream();
+        return;
+    }
+    showStreamError(STREAM_MESSAGES[kind] || STREAM_MESSAGES.generic);
 }
 
 /** Close the watch page and stop playback. */
@@ -224,6 +307,8 @@ export function closeVideoPlayer() {
     if (notice) notice.hidden = true;
     currentVideoData = null;
     playingOffline = false;
+    retryStreamUrl = null;
+    retryDesiredTime = 0;
     stopStallDetection();
     if (videoPlayer) videoPlayer.ontimeupdate = null;
 }
@@ -232,17 +317,12 @@ export function closeVideoPlayer() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Show the current preferred quality on the gear button label. */
 function updateQualityButtonLabel(button) {
     if (!button) return;
     const label = button.querySelector('span:last-child');
     if (label) label.textContent = qualityLabel(getPreferredQuality());
 }
 
-/**
- * Wire the watch-page quality button: opens the picker, saves the choice
- * and reloads the current video at the new quality.
- */
 function setupQualityButton() {
     const qualityButton = $('#qualityButton');
     const videoPlayer = $('#videoPlayer');
@@ -261,6 +341,8 @@ function setupQualityButton() {
             if (notice) notice.hidden = true;
 
             const newStreamUrl = getStreamUrl(currentVideoData.id, newQuality);
+            retryStreamUrl = newStreamUrl;
+            retryDesiredTime = videoPlayer.currentTime || 0;
             videoPlayer.src = newStreamUrl;
             videoPlayer.play().catch(() => {});
 
@@ -270,7 +352,6 @@ function setupQualityButton() {
     };
 }
 
-/** Best human text for the "when" part of the metadata row. */
 function uploadDateText(videoData) {
     if (videoData.publishedText) return videoData.publishedText;
     const raw = videoData.uploadDate || '';
@@ -296,7 +377,6 @@ function uploadDateText(videoData) {
     return raw;
 }
 
-/** Set the icon+label of a watch-page action button. */
 function setButton(button, iconName, label, active) {
     if (!button) return;
     button.innerHTML = '';
@@ -306,7 +386,6 @@ function setButton(button, iconName, label, active) {
     button.classList.toggle('action-button--disliked', !active && iconName === 'thumb_down');
 }
 
-/** Subscribe/unsubscribe area under the video. */
 function setupChannelSection(videoData) {
     const subscribeButton = $('#subscribeButton');
     const subscriberCount = $('#subscriberCount');
@@ -320,7 +399,7 @@ function setupChannelSection(videoData) {
         return;
     }
     if (subscribeButton) subscribeButton.style.display = '';
-    if (subscriberCount) subscriberCount.style.display = 'none'; // unknown count
+    if (subscriberCount) subscriberCount.style.display = 'none';
 
     currentSubscribed = isSubscribed(currentChannelId);
 
@@ -331,7 +410,6 @@ function setupChannelSection(videoData) {
     };
     applySubscribeState();
 
-    // Replace listeners each open so the callback captures this video.
     subscribeButton.onclick = () => {
         if (currentSubscribed) {
             unsubscribeFromChannel(currentChannelId);
@@ -346,7 +424,6 @@ function setupChannelSection(videoData) {
     };
 }
 
-/** Like / dislike / share / download actions under the video. */
 function setupActionButtons(videoData) {
     const likeButton = $('#likeButton');
     const dislikeButton = $('#dislikeButton');
@@ -392,12 +469,6 @@ function setupActionButtons(videoData) {
 
 // --- offline download button (watch page) ---------------------------------
 
-/**
- * The «دانلود» button doubles as the offline control for the current video:
- *   idle        → start the download
- *   downloading → cancel it
- *   ready       → play the local copy
- */
 async function handleDownloadClick(videoData) {
     const entry = offlineSupported() ? await getDownload(videoData.id) : null;
 
@@ -418,7 +489,15 @@ async function handleDownloadClick(videoData) {
 
     try {
         await startDownload(videoData);
-        showToast('دانلود شروع شد — وضعیت را در کتابخانه ببینید');
+        if (!isCurrent(videoData.id)) return;
+        const after = await getDownload(videoData.id);
+        if (after && after.status === 'ready') {
+            showToast('دانلود کامل شد');
+        } else if (after && after.status === 'paused') {
+            showToast('دانلود متوقف شد — برای ادامه دوباره لمس کنید');
+        } else {
+            showToast('دانلود شروع شد — وضعیت را در کتابخانه ببینید');
+        }
     } catch (error) {
         if (!error || error.name === 'cancelled') return;
         console.error('[offline] download failed:', error);
@@ -427,7 +506,10 @@ async function handleDownloadClick(videoData) {
     refreshDownloadButton();
 }
 
-/** Switch the current player to the downloaded Blob (no network needed). */
+function isCurrent(id) {
+    return currentVideoData && currentVideoData.id === id;
+}
+
 async function playOfflineCopy(videoData) {
     const videoPlayer = $('#videoPlayer');
     const notice = $('#streamNotice');
@@ -442,18 +524,16 @@ async function playOfflineCopy(videoData) {
     }
 
     playingOffline = true;
+    retryStreamUrl = null;
     if (notice) notice.hidden = true;
     videoPlayer.src = url;
-    videoPlayer.play().catch((err) => {
-        console.log('Offline playback prevented:', err);
+    videoPlayer.play().catch(() => {
         playingOffline = false;
     });
-    // Keep the watch page visible in case it was hidden behind the sheet.
     if (watchPage) watchPage.style.display = 'block';
     refreshDownloadButton();
 }
 
-/** Sync the download button label with the offline state of the video. */
 async function refreshDownloadButton() {
     const watchPage = $('#watchPage');
     const downloadButton = $('#downloadButton');
@@ -461,31 +541,28 @@ async function refreshDownloadButton() {
     if (!currentVideoData) return;
 
     const entry = offlineSupported() ? await getDownload(currentVideoData.id) : null;
-    if (!currentVideoData) return; // closed while awaiting
+    if (!currentVideoData) return;
 
     if (entry && entry.status === 'ready') {
         setButton(downloadButton, 'offline_pin', 'پخش آفلاین', false);
     } else if (entry && entry.status === 'downloading') {
         setButton(downloadButton, 'download', 'در حال دانلود…', false);
+    } else if (entry && entry.status === 'paused') {
+        setButton(downloadButton, 'download', 'ادامه دانلود', false);
     } else {
         setButton(downloadButton, 'download', 'دانلود', false);
     }
 }
 
-/** React to offline events while the watch page is open. */
 function bindOfflineEvents() {
     if (offlineEventsBound) return;
     offlineEventsBound = true;
 
     document.addEventListener('offline:changed', (event) => {
-        const watchPage = $('#watchPage');
-        if (!watchPage || watchPage.style.display === 'none') return;
         if (!currentVideoData || !event.detail) return;
         if (currentVideoData.id === event.detail.id) refreshDownloadButton();
     });
     document.addEventListener('offline:progress', (event) => {
-        const watchPage = $('#watchPage');
-        if (!watchPage || watchPage.style.display === 'none') return;
         if (!currentVideoData || !event.detail) return;
         if (currentVideoData.id === event.detail.id) refreshDownloadButton();
     });

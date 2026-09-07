@@ -5,6 +5,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# Downloaded runtime binaries (yt-dlp) — never commit binaries
+.runtime/
+
 # Environment files (never commit secrets)
 .env
 .env.*

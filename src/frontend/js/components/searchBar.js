@@ -5,7 +5,6 @@
 
 import { $, clear, el, icon } from '../utils/domUtils.js';
 import {
-    getRecentSearches,
     getSearchSuggestions,
     addRecentSearch,
     clearRecentSearches
