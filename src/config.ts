@@ -109,8 +109,6 @@ export interface AppConfig {
     /** Safety margin subtracted from a signed URL `expire` timestamp. */
     streamExpiryMarginMs: number
     searchTtlMs: number
-    maxVideo: number
-    maxSearch: number
   }
 
   // ---- Feeds --------------------------------------------------------------
@@ -180,9 +178,7 @@ export function readConfig(): AppConfig {
     cache: {
       streamUrlTtlMs: intFromEnv('STREAM_CACHE_TTL_MS', 2 * 60 * 60 * 1000, 60_000),
       streamExpiryMarginMs: intFromEnv('STREAM_CACHE_EXPIRY_MARGIN_MS', 5 * 60 * 1000, 0),
-      searchTtlMs: intFromEnv('SEARCH_CACHE_TTL_MS', 3 * 60 * 1000, 10_000),
-      maxVideo: intFromEnv('CACHE_MAX_VIDEO', 200, 10),
-      maxSearch: intFromEnv('CACHE_MAX_SEARCH', 100, 10)
+      searchTtlMs: intFromEnv('SEARCH_CACHE_TTL_MS', 3 * 60 * 1000, 10_000)
     },
 
     feed: {

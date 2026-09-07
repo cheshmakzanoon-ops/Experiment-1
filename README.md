@@ -222,7 +222,6 @@ Secrets are marked 🔒 — set them in the platform env UI / deployment env;
 | `UPSTREAM_MAX_REDIRECTS` | `5` | safe redirect hop limit |
 | `STREAM_CACHE_TTL_MS` / `STREAM_CACHE_EXPIRY_MARGIN_MS` | `2 h` / `5 min` | signed-URL cache policy |
 | `SEARCH_CACHE_TTL_MS` | `3 min` | search cache (household-friendly) |
-| `CACHE_MAX_VIDEO` / `CACHE_MAX_SEARCH` | `200` / `100` | cache bounds |
 | `FEED_BATCH_SIZE` / `FEED_TTL_MS` | `50` / `20 min` | per-category batch policy |
 | `HOME_FEED_BATCH_SIZE` / `HOME_FEED_TTL_MS` | `48` / `15 min` | home feed batch policy |
 | `ENABLE_DIAGNOSTICS` | `false` | expose `/api/diag/*` (authenticated) |

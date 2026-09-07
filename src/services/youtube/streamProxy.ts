@@ -203,6 +203,16 @@ function withReadTimeout(body: ReadableStream<Uint8Array>): ReadableStream<Uint8
 // Range policy for the client request
 // ---------------------------------------------------------------------------
 
+export function rejectMalformedRangeEarly(
+  rawRange: string | undefined | null,
+  knownTotal?: number
+): { status: 416; contentRange: string } | null {
+  const parse = parseRangeHeader(rawRange)
+  if (parse.kind === 'absent' || parse.kind === 'valid') return null
+  const total = knownTotal && knownTotal > 0 ? knownTotal : undefined
+  return { status: 416, contentRange: contentRangeForUnsatisfiable(total) }
+}
+
 interface ClientRangeDecision {
   /** Forwarded header value (undefined = no range upstream). */
   forwarded: string | undefined
@@ -212,15 +222,23 @@ interface ClientRangeDecision {
   totalSize?: number
 }
 
+/**
+ * Decide what to forward for an already-validated range. Malformed ranges
+ * never reach this point — rejectMalformedRangeEarly answers them before
+ * any cache/extraction work — so only absent or valid specs are handled
+ * here. A valid-but-unsatisfiable range (decidable only once a total is
+ * known) is still answered locally with 416 before any upstream fetch.
+ */
 function decideClientRange(
-  rawRange: string | undefined,
+  parse: ReturnType<typeof parseRangeHeader>,
   knownTotal: number | undefined
 ): { decision: ClientRangeDecision } | { error: { status: 416; contentRange: string } } {
-  const parse = parseRangeHeader(rawRange)
   if (parse.kind === 'absent') {
     return { decision: { forwarded: undefined, parse } }
   }
   if (parse.kind === 'invalid') {
+    // Unreachable from proxyVideoStream (rejectMalformedRangeEarly answers
+    // invalid ranges first) — retained only to narrow the union; fail safe.
     const total = knownTotal && knownTotal > 0 ? knownTotal : undefined
     return { error: { status: 416, contentRange: contentRangeForUnsatisfiable(total) } }
   }
@@ -361,12 +379,28 @@ export async function proxyVideoStream(
   const headOnly = c.req.raw.method === 'HEAD'
   const signal = c.req.raw.signal
 
+  // Malformed/unsupported ranges are rejected BEFORE any cache lookup or
+  // extraction work: junk requests must never burn a yt-dlp run.
+  const earlyRejection = rejectMalformedRangeEarly(
+    clientRange,
+    streamCache.get(videoId, maxHeight)?.filesize
+  )
+  if (earlyRejection) {
+    const headers: Record<string, string> = {
+      'Content-Range': earlyRejection.contentRange,
+      'Cache-Control': 'private, no-store'
+    }
+    if (headOnly) return new Response(null, { status: 416, headers })
+    return c.json({ error: 'Range not satisfiable', code: 'RANGE_INVALID' }, 416, headers)
+  }
+
   let source = await resolveStreamSource(videoId, maxHeight, false, { signal })
 
-  // Decide the range policy BEFORE any upstream work. A malformed or
-  // unsupported range is rejected locally with 416 — never forwarded, never
-  // a silent full download.
-  const rangeDecision = decideClientRange(clientRange, source.filesize)
+  // Decide the range policy BEFORE any upstream work. Unsatisfiable ranges
+  // (only decidable once a total is known) are rejected locally with 416 —
+  // never forwarded, never a silent full download. Malformed ranges were
+  // already rejected above, before any cache/extraction work.
+  const rangeDecision = decideClientRange(parseRangeHeader(clientRange), source.filesize)
   if ('error' in rangeDecision) {
     const { status, contentRange } = rangeDecision.error
     const headers: Record<string, string> = { 'Content-Range': contentRange, 'Cache-Control': 'private, no-store' }

@@ -20,13 +20,21 @@
  */
 
 import type { Context, MiddlewareHandler } from 'hono'
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { config } from '../config.js'
 
 export const SESSION_COOKIE = 'ft_session'
 export const SESSION_ID_HEADER = 'x-session-id' // set on authenticated responses (never the secret)
 
-const PAYLOAD_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+/**
+ * One source of truth for the session lifetime: the operator-tunable
+ * SESSION_TTL_DAYS (default 30). The cookie Max-Age AND the signed token
+ * expiry both come from here so a configured lifetime can never be silently
+ * shortened by a stale fixed constant (a 365-day cookie dying at 30 days).
+ */
+export function sessionTokenLifetimeMs(): number {
+  return Math.max(1, config.sessionTtlDays) * 24 * 60 * 60 * 1000
+}
 
 // ---------------------------------------------------------------------------
 // Server-side revocation (logout). Signed tokens are stateless, so simply
@@ -114,11 +122,10 @@ export function safeEqual(a: string, b: string): boolean {
 
 export function issueSessionToken(now = Date.now()): string {
   const payload: SessionPayload = {
-    exp: now + PAYLOAD_TTL_MS,
-    sid: createHmac('sha256', config.sessionSecret)
-      .update(`${now}:${Math.random()}`)
-      .digest('base64url')
-      .slice(0, 18)
+    exp: now + sessionTokenLifetimeMs(),
+    // Unpredictable per-session nonce (never Math.random) — revocation and
+    // future rotation rely on it being unguessable.
+    sid: randomBytes(18).toString('base64url')
   }
   const encoded = base64urlEncode(JSON.stringify(payload))
   return `${encoded}.${sign(encoded)}`
@@ -219,7 +226,7 @@ export interface SessionUser {
 /** Return the verified session (or null). */
 export function currentSession(c: Context): SessionUser | null {
   if (authIsDisabled()) {
-    return { sid: 'dev', expiresAt: Date.now() + PAYLOAD_TTL_MS }
+    return { sid: 'dev', expiresAt: Date.now() + sessionTokenLifetimeMs() }
   }
   const payload = verifySessionToken(readSessionToken(c))
   return payload ? { sid: payload.sid, expiresAt: payload.exp } : null
