@@ -53,7 +53,9 @@ const BROWSER_GLOBALS = {
   self: 'readonly',
   caches: 'readonly',
   clients: 'readonly',
-  skipWaiting: 'readonly'
+  skipWaiting: 'readonly',
+  // Worker constructor (module-worker capability probe in app.js):
+  Worker: 'readonly'
 }
 
 export default [

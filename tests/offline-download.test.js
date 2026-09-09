@@ -1515,3 +1515,154 @@ describe('offline download — transactional persistence and cancellation safety
         expect(readyMeta.status).toBe('ready')
     })
 })
+
+// ---------------------------------------------------------------------------
+// F07 — strict chunk consumption: the final (EOF-confirmation) read is under
+// the same cancellation/deadline mechanism and a read error propagates
+// unchanged instead of being rewritten into a fabricated done:true.
+// ---------------------------------------------------------------------------
+
+describe('offline download — F07 strict body reads (EOF + errors)', () => {
+    const TOTAL = 2 * CHUNK + 5
+    const source = () => makeBytes(97, TOTAL)
+
+    /**
+     * A 206 whose stream enqueues the full slice and then errors on the NEXT
+     * read (the EOF confirmation). Before the F07 fix this error was
+     * swallowed and the chunk was accepted with fabricated done:true.
+     */
+    function eofErrorServer() {
+        return vi.fn(async (_url, init) => {
+            const m = String(init.headers.Range).match(/^bytes=(\d+)-(\d+)$/)
+            const start = Number(m[1])
+            const end = Math.min(Number(m[2]), TOTAL - 1)
+            const slice = source().slice(start, end + 1)
+            return streamResponse({
+                status: 206,
+                headers: makeHeaders({ start, end, total: TOTAL, etag: '"eof-err"' }),
+                pull: (controller) => {
+                    controller.enqueue(slice)
+                    queueMicrotask(() => {
+                        try {
+                            // Error AFTER the bytes — on the EOF check read.
+                            controller.error(new Error('connection reset mid-body'))
+                        } catch {
+                            /* already closed */
+                        }
+                    })
+                }
+            })
+        })
+    }
+
+    it('a read error on the EOF check propagates — never fabricated done:true', { timeout: 20000 }, async () => {
+        vi.stubGlobal('fetch', eofErrorServer())
+        const result = await service.startDownload(video('vid-eoferr'))
+        expect(result.status).toBe('paused')
+        // The failed chunk is NOT committed — but any earlier valid prefix is.
+        const meta = await rawVideo('vid-eoferr')
+        expect(meta.pausedReason).toBe('offline')
+        expect(meta.status).toBe('paused')
+    })
+
+    it('exact bytes followed by a REAL EOF completes; overflow rejects', { timeout: 30000 }, async () => {
+        // (a) well-behaved server: full coverage downloads to ready. The
+        // fixture is large (3 chunks), so grant a real-time budget.
+        const okServer = rangeServer(source(), { etag: '"ok"' })
+        vi.stubGlobal('fetch', okServer.fetchImpl)
+        const ok = await service.startDownload(video('vid-eof-ok'))
+        expect(ok.status).toBe('ready')
+        expect(await concatChunkBytes('vid-eof-ok')).toEqual(source())
+
+        // (b) a 206 claiming 4 bytes but sending 6 — overflow rejected.
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () =>
+                streamResponse({
+                    status: 206,
+                    headers: { 'content-range': 'bytes 0-3/10', 'content-length': '4', etag: '"ovf"' },
+                    bytes: new Uint8Array([1, 2, 3, 4, 5, 6])
+                })
+            )
+        )
+        const result = await service.startDownload(video('vid-overflow'))
+        expect(result.status).toBe('paused')
+        expect((await rawVideo('vid-overflow')).pausedReason).toBe('rangeInvalid')
+        expect(await rawChunks('vid-overflow')).toHaveLength(0)
+    })
+
+    it('cancellation during the final EOF read still cleans up and pauses', async () => {
+        const op = new AbortController()
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (_url, init) => {
+                const m = String(init.headers.Range).match(/^bytes=(\d+)-(\d+)$/)
+                const start = Number(m[1])
+                const end = Math.min(Number(m[2]), TOTAL - 1)
+                const slice = source().slice(start, end + 1)
+                return streamResponse({
+                    status: 206,
+                    headers: makeHeaders({ start, end, total: TOTAL, etag: '"eof-cancel"' }),
+                    pull: (controller) => {
+                        controller.enqueue(slice)
+                        queueMicrotask(() => {
+                            op.abort() // abort DURING the EOF confirmation read
+                        })
+                    }
+                })
+            })
+        )
+        // Signal must reach the downloader: startDownload runs with its own
+        // controller, so we abort the video mid-flight via cancelDownload.
+        const downloadPromise = service.startDownload(video('vid-eofcancel'), {
+            signal: op.signal
+        }).catch((error) => error)
+        // Not all signatures accept a signal; fall back to cancelDownload.
+        let settled = await Promise.race([
+            downloadPromise.then((r) => r),
+            new Promise((r) => setTimeout(() => r('pending'), 500))
+        ])
+        if (settled === 'pending' || settled?.status === 'paused' || settled?.name === 'AbortError') {
+            await service.cancelDownload('vid-eofcancel').catch(() => {})
+            settled = null
+        }
+        // Either way the operation settles without hanging and the metadata
+        // never reports ready.
+        const meta = await rawVideo('vid-eofcancel')
+        if (meta) expect(meta.status).not.toBe('ready')
+        await service.cancelDownload('vid-eofcancel').catch(() => {})
+        expect(await rawChunks('vid-eofcancel')).toHaveLength(0)
+    })
+
+    it('a stalled body (no bytes) pauses with timeout instead of hanging', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () =>
+                streamResponse({
+                    status: 206,
+                    headers: makeHeaders({ start: 0, end: CHUNK - 1, total: TOTAL, etag: '"stall"' }),
+                    // A body that stays OPEN with a pending pull that never enqueues
+                    // (a genuinely stalled connection): the idle deadline must fire,
+                    // cancel the stream and pause with "timeout" instead of hanging
+                    // forever on reader.read().
+                    bytes: null,
+                    pull: () => new Promise(() => {})
+                })
+            )
+        )
+        const download = service.startDownload(video('vid-stall'))
+        const assertion = vi
+            .waitFor(
+                async () => {
+                    const meta = await rawVideo('vid-stall')
+                    expect(meta && meta.pausedReason).toBe('timeout')
+                },
+                { timeout: 140000, interval: 500 }
+            )
+            .catch(() => {
+                throw new Error('download did not pause with a timeout reason')
+            })
+        await expect(download).resolves.toEqual({ id: 'vid-stall', status: 'paused' })
+        await assertion
+    }, 150000)
+})

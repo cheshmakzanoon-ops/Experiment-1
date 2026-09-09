@@ -82,6 +82,45 @@ FREEBUFF_SMOKE_KEY=test-key node scripts/smoke.mjs http://127.0.0.1:3457
 If YouTube is reachable from this machine it will pass end-to-end;
 otherwise it reports the YouTube-egress block distinctly (see below).
 
+### Reliability-repair verification record (this working tree)
+
+Recorded from the F01–F31 reliability repair pass on this checkout
+(Node v22.23.1, yt-dlp pinned 2026.08.19 verified by SHA-256, JS runtime
+`node`). Evidence, in the order run:
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Deps | `npm ci --include=dev` | clean install from lockfile |
+| Lint | `npm run lint` | 0 errors (0 warnings; `--max-warnings=0`) |
+| Types | `npm run typecheck` | pass (`tsc -b --noEmit`) |
+| Unit/contract suite | `npm test` | **17 files / 204 tests passed** |
+| Build | `npm run build` | pass (prebuild regenerates the content-derived shell manifest) |
+| Runtime ensure ×2 | `node scripts/ensure-runtime.mjs` (twice) | idempotent — no re-download |
+| Live boot | `PORT=3457 HOST=127.0.0.1 NODE_ENV=production ACCESS_KEY=… SESSION_SECRET=… SESSION_STORE_PATH=/tmp/test-sessions.json node dist/index.js` | session store ready, runtime verified, listening |
+| Live checks | curl: `/api/health/live` · `/api/health/ready` · anonymous `/api/feed/categories` · login → authed call · `/` · `/js/shell-manifest.js` · malformed multi-range `Range: bytes=0-1,5-9` on `/api/stream/:id` | 200 · ready (yt-dlp 2026.08.19, jsRuntime node) · 401 · `{authenticated:true}` then 200 · 200 · 200 · **416** |
+| Smoke (dry run) | `FREEBUFF_SMOKE_KEY=… node scripts/smoke.mjs http://127.0.0.1:3457` | **VERDICT: PASS — 16 passed, exit 0** (incl. 206 first/mid/suffix ranges, 416 malformed + unsatisfiable `bytes */TOTAL`, no signed-URL leakage, diagnostics off) |
+
+Repair-specific regressions now covered by the suite (beyond the earlier
+baseline):
+
+- **Content-derived shell manifest (F01/F02):** generated manifest covers the
+  complete executable shell (every importable module, stylesheet, self-hosted
+  font, document, the worker itself — 30+ paths), every listed path exists on
+  disk, and the generation id changes when shell content changes
+  (`tests/sw-policy.test.mjs`).
+- **Strict SW install/activate (F03):** a failed required precache rejects
+  installation (no swallowed addAll), staging-cache-only cleanup, namespace-
+  scoped retirement only after activation (`tests/sw-policy.test.mjs`).
+- **Strict offline body reads (F07):** a read error on the EOF-confirmation
+  read propagates (never fabricated `done:true`); a genuinely stalled body
+  (open stream, pending pull) pauses with `timeout` through the documented
+  3-attempt transient retry budget instead of hanging; cancellation during
+  the EOF read still cleans up (`tests/offline-download.test.js` F07 block).
+
+What this record does **not** prove (external by design): Freebuff ingress
+Range survival, phone/Iran reachability, and YouTube's opinion of the egress
+IP — run Phase 2 against the real deployed URL for those.
+
 **What localhost proves:** the Node process boots, honors `$PORT`, serves
 the UI, enforces the session, resolves ranges correctly against real
 YouTube (when egress works) and the code quality gates are green.

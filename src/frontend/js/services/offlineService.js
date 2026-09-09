@@ -421,6 +421,16 @@ function abortError(message) {
     return error;
 }
 
+/**
+ * Monotonic elapsed-time source for active deadlines (F07): a drifting or
+ * adjusted wall clock can no longer extend or truncate a deadline.
+ */
+function monotonicNow() {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
+}
+
 function isAbort(error) {
     return Boolean(error) && (error.name === 'AbortError' || error.name === 'cancelled');
 }
@@ -447,13 +457,29 @@ function rangeError(kind, extra) {
     return new ApiError(kind, extra || {});
 }
 
-/** Read one bounded 206 body with strict counting + deadlines. */
+/**
+ * Read one bounded 206 body with strict counting + deadlines (F07).
+ *
+ * EVERY awaited read — including the EOF confirmation after the expected
+ * byte count has arrived — runs under the SAME cancellation, idle-timeout
+ * and absolute-deadline mechanism. A read error (or an error on the EOF
+ * check) propagates UNCHANGED: the historic `catch(() => ({done:true}))`
+ * that fabricated a successful EOF out of a rejected read is gone. The
+ * absolute deadline uses monotonic elapsed time so it expires even when
+ * bytes keep trickling, and rejection never depends on an uncooperative
+ * reader.cancel() promise settling.
+ */
 async function readRangeBody(reader, expectedLength, startedAt, signal) {
     const chunks = [];
     let counted = 0;
     let idleTimer = null;
-    const bodyDeadline = startedAt + BODY_OVERALL_DEADLINE_MS;
-    const onAbort = () => reader.cancel().catch(() => {});
+    // Monotonic anchor: the overall body deadline expires even when bytes
+    // keep trickling, regardless of wall-clock adjustments.
+    const startMono = monotonicNow();
+    const deadlineMono = startMono + BODY_OVERALL_DEADLINE_MS;
+    const onAbort = () => {
+        reader.cancel().catch(() => {});
+    };
     signal.addEventListener('abort', onAbort, { once: true });
 
     const clearTimers = () => {
@@ -469,34 +495,62 @@ async function readRangeBody(reader, expectedLength, startedAt, signal) {
     };
 
     let idleTimeout = false;
+    /** Bounded read under the shared deadline/cancel mechanism. */
+    const guardedRead = async () => {
+        armIdle();
+        try {
+            return await reader.read();
+        } finally {
+            clearTimers();
+        }
+    };
+
     try {
         for (;;) {
-            if (idleTimeout) {
+            if (signal.aborted) throw abortError();
+            if (idleTimeout) throw rangeError('timeout');
+            if (monotonicNow() > deadlineMono) {
+                reader.cancel().catch(() => {});
                 throw rangeError('timeout');
             }
-            if (Date.now() > bodyDeadline) {
-                await reader.cancel().catch(() => {});
-                throw rangeError('timeout');
+
+            let readResult;
+            try {
+                readResult = await guardedRead();
+            } catch (readError) {
+                if (signal.aborted) throw abortError();
+                // Propagate the read failure UNCHANGED into the taxonomy as a
+                // genuine network failure — never a fabricated done:true.
+                throw new ApiError('offline', { cause: readError });
             }
-            armIdle();
-            const { done, value } = await reader.read();
-            clearTimers();
+            const { done, value } = readResult;
             if (signal.aborted) throw abortError();
             if (done) break;
             if (value && value.byteLength > 0) {
                 counted += value.byteLength;
                 if (counted > expectedLength) {
-                    // Overflow: cancel immediately; never accumulate more.
-                    await reader.cancel().catch(() => {});
+                    // Overflow: stop accumulating immediately; do not wait
+                    // for an uncooperative cancel to settle.
+                    reader.cancel().catch(() => {});
                     throw rangeError('rangeInvalid');
                 }
                 chunks.push(value);
             }
             if (counted === expectedLength) {
-                // Stop reading — a well-behaved 206 has no more bytes.
-                const rest = await reader.read().catch(() => ({ done: true }));
-                if (!rest.done) {
-                    await reader.cancel().catch(() => {});
+                // Exactly the promised bytes arrived. A well-behaved 206 ends
+                // here; the NEXT read must confirm EOF under the SAME
+                // deadlines/cancellation. An error there is an error (F07):
+                // it must never be rewritten into done:true.
+                let eofResult;
+                try {
+                    eofResult = await guardedRead();
+                } catch (eofError) {
+                    if (signal.aborted) throw abortError();
+                    throw new ApiError('offline', { cause: eofError });
+                }
+                if (!eofResult.done) {
+                    // More bytes than promised — the range lied.
+                    reader.cancel().catch(() => {});
                     throw rangeError('rangeInvalid');
                 }
                 break;
@@ -508,7 +562,7 @@ async function readRangeBody(reader, expectedLength, startedAt, signal) {
         try {
             reader.releaseLock();
         } catch {
-            /* ignore */
+            /* lock already released */
         }
     }
     if (idleTimeout) throw rangeError('timeout');

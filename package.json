@@ -9,15 +9,18 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "prebuild": "node scripts/build-shell-manifest.mjs",
     "build": "tsc",
     "typecheck": "tsc -b --noEmit",
     "start": "node dist/index.js",
     "bootstrap:runtime": "node scripts/bootstrap-runtime.mjs",
     "prestart": "node scripts/ensure-runtime.mjs",
+    "pretest": "node scripts/build-shell-manifest.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/frontend --max-warnings=0",
     "lint:all": "npm run lint && npm run typecheck",
+    "shell:manifest": "node scripts/build-shell-manifest.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

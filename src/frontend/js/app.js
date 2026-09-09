@@ -140,25 +140,85 @@ function initNativeWrapper() {
 /**
  * Offline/low-bandwidth cache (sw.js). Best-effort: unsupported browsers or
  * restricted contexts (e.g. private browsing) simply keep working online.
+ *
+ * Registration details (F03):
+ *   • registers in the app's own top scope ('/') and unregisters any stale
+ *     handle found OUTSIDE that scope instead of fighting over scope,
+ *   • module-worker support is probed once; no classic-worker fallback is
+ *     attempted (this sw.js imports ES modules — a classic worker would
+ *     die on its first import and leave a half-installed shell),
+ *   • exactly ONE controlled reload per generation: the worker announces a
+ *     new verified generation only after its full manifest has activated,
+ *     and the page reloads once per generation id (never in a loop).
  */
+const SW_SCOPE = '/';
+const SW_GENERATION_KEY = 'swShellGeneration';
+let shellReloadArmed = false;
+
 function registerServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
+    if (typeof Worker !== 'undefined') {
+        try {
+            // Capability probe: module workers need import() support. The
+            // blob worker terminates immediately; nothing is fetched.
+            new Worker(
+                URL.createObjectURL(
+                    new Blob(['self.registration;'], { type: 'text/javascript' })
+                ),
+                { type: 'module' }
+            ).terminate();
+        } catch {
+            console.warn('[sw] module workers unsupported — staying online-only');
+            return;
+        }
+    }
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
-        registerSw();
+        void registerSw();
     } else {
-        window.addEventListener('load', registerSw);
+        window.addEventListener('load', () => void registerSw());
     }
 }
 
-function registerSw() {
-    // Module worker: sw.js imports the shared caching policy from
-    // js/sw-policy.js. Unsupported browsers reject the promise and the app
-    // simply stays online-only — never fatal.
-    navigator.serviceWorker
-        .register('sw.js', { type: 'module' })
-        .catch((error) => {
-            console.warn('[sw] registration failed:', error);
+async function registerSw() {
+    try {
+        // Stale registrations outside our scope cannot serve this shell.
+        const expectedScope = new URL(SW_SCOPE, location.href).href;
+        const existing = await navigator.serviceWorker.getRegistrations();
+        for (const stale of existing) {
+            if (stale.scope !== expectedScope) {
+                await stale.unregister().catch(() => {});
+            }
+        }
+
+        await navigator.serviceWorker.register('sw.js', {
+            scope: SW_SCOPE,
+            type: 'module'
         });
+
+        // ONE controlled reload per generation: the worker sends this after
+        // its complete manifest activated. Download writes are transactional
+        // (IndexedDB), so a reload never corrupts a partial chunk write.
+        navigator.serviceWorker.addEventListener('message', (event) => {
+            const data = event && event.data;
+            if (!data || data.type !== 'shell-generation-active') return;
+            let lastGeneration = null;
+            try {
+                lastGeneration = sessionStorage.getItem(SW_GENERATION_KEY);
+            } catch {
+                /* private mode: the armed flag still guards the loop */
+            }
+            if (lastGeneration === data.generation || shellReloadArmed) return;
+            shellReloadArmed = true;
+            try {
+                sessionStorage.setItem(SW_GENERATION_KEY, String(data.generation));
+            } catch {
+                /* non-fatal */
+            }
+            window.location.reload();
+        });
+    } catch (error) {
+        console.warn('[sw] registration failed:', error);
+    }
 }
 
 /** Shorts shelf needs a data source (later phase); show a friendly stub. */
