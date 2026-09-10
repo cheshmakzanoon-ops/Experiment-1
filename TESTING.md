@@ -17,6 +17,66 @@ server is running (see README → Quick start). Two distinct phases:
 
 ---
 
+## Experiment-1 reliability remediation — active packet
+
+> Single durable execution ledger for the reliability-remediation
+> assignment. Replace this packet's contents in place as stages complete;
+> keep the active context around 800–1,200 words and put durable executed
+> results in the table below the packet. Do not append repeated plans or
+> full logs here.
+
+**Baseline SHA and current branch:** `f898e3f7c12bd62b02609d1b50357c23093d9adb` on `main` (origin `https://github.com/cheshmakzanoon-ops/Experiment-1.git`, single worktree at repo root, HEAD == audit SHA at assignment start).
+
+**Baseline gate results (executed, before any production edit):**
+`npm ci --include=dev` exit 0 · `npm run lint` exit 0 · `npm run typecheck` exit 0 · `npm run build` exit 0 (prebuild regenerated `src/frontend/js/shell-manifest.js`, diff reviewed, no unintended content change) · `npm test` exit 0 — **17 files / 204 tests passed**. Node v22.23.1, npm 10.9.8. Pre-existing dirty paths: none (clean `git status --short` before any work).
+
+**Pre-existing dirty paths that must remain untouched:** none at start; verify with `git status --short` before every commit and stage only files named in the current repair.
+
+**Current stage and issue IDs:** Stage 3 — A03/A05/A10 implemented, tested, and green (this working tree).
+
+**Current invariant being repaired:** done this stage — durable download ownership across contexts (A03/A10, `operations` store v3, heartbeat fencing) and legacy schema preservation (A05).
+
+**Files/functions actually inspected (with line ranges as of inspection):**
+- `src/frontend/js/services/offlineService.js` — `openDb` (L18–34), `transaction` helper (L36–49), `requestChunk` (L410–560), `runDownload` (L560–700), `operations` in-memory map (L15), DB `yt-offline-db` v2, stores `videos`/`chunks`, upgrade deletes `blobs` (L25).
+- `src/frontend/js/api.js` — `buildGate` (L15–40), `fetchSessionState` (L45–70), `ensureAuthenticatedOnce` (L75–110), `waitForGateOrAbort` (L115–140), `apiFetch` (L150–200), `apiGetJson` (L205–235).
+- `src/frontend/sw.js` — `installShell` (L8–45), `fetchWithTimeout` (L50–75), `networkFirst` (L90–120), `activateGeneration` (L150–180).
+- `src/frontend/js/app.js` — `registerServiceWorker` (L20–60), `navigateToPage` (L80–120), `runSearch` (L300–340).
+- `src/services/ytdlp/runYtDlp.ts` — `spawnYtDlpProcess` (L60–220), `terminateAllChildren` (L240–280); `src/services/ytdlp/queue.ts` — `startFlight`/`finishFlight`/`cancelWaiter` (L40–180); `src/middleware/session.ts` — `verifySessionToken`/`issueSessionToken`/`revokeSessionToken` (L20–160); `src/services/sessionStore.ts` — `initialize`/`add`/`remove`/`persistSnapshot` (L30–260); `src/services/youtube/extractor.ts` — `selectBestStream`/`toSelectedStream`/`extractRawInfo` (L80–400); `src/services/youtube/trendingService.ts` — `loadHomeBatch`/`getHomeFeed`/`loadBatchForQuery` (L40–260); `src/frontend/js/components/homeFeed.js` (full); `src/frontend/js/components/videoPlayer.js` — `openVideoPlayer`/`handleStreamError`/`classifyStreamFailure`/`retryCurrentStream` (L60–400); `src/services/youtube/streamProxy.ts`, `src/utils/net.ts`, `src/middleware/streamCache.ts`, `src/services/diagnostics.ts` + diagnostic/stream/session routes, `src/middleware/rateLimit.ts`, `src/index.ts` (composition + shutdown), `android/*` listed in stage 13, `scripts/build-shell-manifest.mjs`, `src/frontend/index.html`, `scripts/bootstrap-runtime.mjs`, `scripts/ensure-runtime.mjs`, `Dockerfile`, `docker-compose.yml`, `build-apk.sh`.
+
+**Last verified checkpoint:** baseline commit `f898e3f` (all five gates green: lint 0 problems, typecheck clean, build ok, 17 files/204 tests passed).
+
+**Current failing regression:** none yet — first red regression to be authored for A03/A05/A10.
+
+**Last executed command / exit status:** `npx vitest run` exit 0 (**18 files / 217 tests**, 117 s) — includes the new `tests/offline-ownership.test.js` (13 A03/A05/A10 regressions) and the regenerated shell manifest.
+
+**Decisions already made and alternatives rejected:**
+- Use one additive IndexedDB `operations` store (v2→v3) for durable ownership/fencing rather than requiring BroadcastChannel/Web Locks for correctness; those remain notifications/optimizations only.
+- Shared bounded JSON body-deadline helper in `api.js` (`apiGetJson`) instead of post-hoc `.json()` in feed/search services; raw media responses keep their separate deadlines (never read a movie to time an API call).
+- Browser regression coverage via `@playwright/test` (pinned version recorded when installed) with real HTTP fixture servers; no fetch mocks for worker-owned requests; keep `.spec.mjs` files outside Vitest's `*.test.*` glob.
+- No FFmpeg merger, no HLS/DASH architecture (A09 stays on progressive combined-format contract); unsupported content gets explicit `FORMAT_UNAVAILABLE` outcomes.
+- Docker is secondary; Freebuff remains primary; no destructive cache/DB resets as repairs.
+
+**Schema/API/worker message changes already introduced:** `yt-offline-db` v2→v3: additive `operations` store (`videoId: "owner:<id>"` keyPath, heartbeat-fenced ownership records). The v2 upgrade-handler deletion of the legacy `blobs` store was REMOVED — the store is preserved (A05).
+
+**Pending migrations and compatibility readers:** shipped this stage — legacy v1 monolithic-Blob compatibility reader (`getLegacyDownload`/`isValidLegacyRow`/`legacyRecord`/`playLegacyBlobUrl`); legacy rows surface in `getDownload`/`getDownloads` and remain byte-playable via `offlinePlayUrl`; only explicit user cancel/remove deletes a legacy row (`deleteLegacyBlobRecord`). No automatic migration of legacy rows into chunks (not needed for correctness; original preserved).
+
+**Owned test processes, temp dirs, cleanup obligations:** none open. Test-owned artifact rules: fixtures only under `tests/` or `.runtime`-ignored paths; no generated media, binaries, profiles or node_modules committed; remove only task-created temp dirs at stage end.
+
+**Next three concrete actions:** (1) run the Playwright real-browser cross-context ownership spec (`test:browser`) once a display server is reachable and record results; (2) continue the audit-ID sequence (next: A01/A02 rate-limit/session repairs, A04 bounded extraction) with the same red→green discipline; (3) keep the ledger's durable-results table appended per ID as stages complete.
+
+**Blockers and evidence needed to remove each:**
+- No external YouTube egress / real deployment URL available in this sandbox → real-egress phases (Phase 2 smoke, Gate D real-YouTube items) stay externally BLOCKED; recorded as such rather than fabricated.
+- No Android emulator/device/SDK → A17 instrumentation tier stays unverified; JVM tests + browser navigation/offline tests are the local evidence tier.
+- Docker daemon availability unconfirmed → A16 image build attempted only if the daemon exists; otherwise BLOCKED with the exact condition.
+
+### Durable executed results (append-only, newest last per ID)
+
+- **2026-09-09 baseline (commit `f898e3f`, main):** `npm ci --include=dev` ✓ · lint ✓ (0 problems) · typecheck ✓ · build ✓ · `npm test` ✓ **17 files / 204 tests**. Node v22.23.1, npm 10.9.8.
+- **2026-09-10 A03/A05/A10 real-browser tier (working tree, not yet committed):** `npm run test:browser` (Playwright 1.49.1, headless Chromium 1148, real IndexedDB + CacheStorage) — **5/5 passed** in `tests/browser/offlineOwnership.spec.mjs` against a real HTTP fixture server (`tests/browser/fixtureServer.mjs`) serving the SHIPPED `src/frontend` tree verbatim: (1) a download completing in page A releases its durable ownership row and is byte-complete; (2) a second page observes a live foreign download (`ownedByOtherContext`) and never spawns a rival writer, and resumes to `ready` after the claim releases with data intact; (3) cancel/remove refuse to delete data under a LIVE foreign claim, and proceed once the claim expires; (4) a startDownload over a live foreign claim reports the foreign state, an expired claim is re-claimed; (5) a v1 profile upgrades to v3 keeping `blobs` readable/playable/deletable with a corrupt row invisible. Debug evidence of the fixture harness: no re-download on resume (single chunk row), ownership row absent after settlement.
+- **2026-09-09 A03/A05/A10 stage (working tree, not yet committed):** Production changes all in `src/frontend/js/services/offlineService.js`: DB v3 additive `operations` store (upgrade no longer deletes `blobs`); durable heartbeat-fenced ownership (`readOwnership`/`claimOwnership`/`releaseOwnership`, 4 s heartbeat / 15 s liveness); fenced chunk commits (`writeOwnedChunkTransaction`), fenced representation restart (`resetForNewRepresentation`), atomic liveness-aware fenced delete (`deleteVideoDataFenced`); startDownload registers a deferred settlement promise synchronously (cancel-vs-start race closed; a racing cancel always awaits real settlement before delete) and refuses to spawn a rival writer when a live foreign owner holds the claim; cancel/remove refuse to tear down a live foreign owner's data; legacy compat reader + playback + explicit-user-only legacy deletion (A05). New tests: `tests/offline-ownership.test.js` (13 cases: store preservation, legacy list/play/delete/corrupt-row, live-foreign start/cancel/remove refusal, expired-claim re-claim/resume/deletable, heartbeat refresh, fenced writes). Harness: `tests/helpers/offlineHarness.mjs`; `tests/offline-download.test.js` raw opens made versionless. `npm run lint` ✓ 0 problems · `npx vitest run` ✓ **18 files / 217 tests** (117 s). Shell generation regenerated (`sh-c9c6c9d4c2d7af4e`) after service content change; `tests/sw-policy.test.mjs` ✓ 9/9.
+
+---
+
 ## Phase 1 — Local verification (automated)
 
 From the project root:

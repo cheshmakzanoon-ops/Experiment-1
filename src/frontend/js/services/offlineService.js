@@ -22,8 +22,8 @@
 //     Retry-After (a Retry-After over 30 s pauses with a retry timestamp);
 //     one reauthentication allowance per chunk operation, a second 401 is
 //     terminal for that operation,
-//   • only explicit cancel/remove deletes partial data (awaited, real
-//     transaction across both stores),
+//   • only explicit cancel/remove deletes partial data (awaited,
+//     ownership-fenced transaction across all stores),
 //   • if the underlying object changes between chunks (established ETag /
 //     total / Last-Modified without a strong ETag) the download performs
 //     ONE clean restart; a second change pauses with SOURCE_CHANGED,
@@ -33,18 +33,23 @@
 //   • per-chunk deadlines: 180 s to response headers, 30 s body idle,
 //     120 s overall body time; timers/listeners cleared on every path.
 //
-// IndexedDB schema (v2 — additive only):
+// IndexedDB schema (v3 — additive only; the v1 `blobs` store is preserved):
 //   videos  { id, …meta, status: downloading|paused|ready, totalBytes,
 //             completedBytes, chunkCount, mimeType, quality, etag,
 //             etagStrong, lastModified, createdAt, updatedAt, … }
 //   chunks  { key: "<videoId>:<index>", start, end, blob, size }
+//   operations { videoId: "owner:<videoId>", owner, acquiredAt,
+//                heartbeatAt, previousOwner } — durable cross-context
+//                download ownership (A03/A10), heartbeat-fenced
 
 import { ApiError, sessionEnforced, waitForGateOrAbort } from '../api.js';
 
 const DB_NAME = 'yt-offline-db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const VIDEOS_STORE = 'videos';
 const CHUNKS_STORE = 'chunks';
+const OPERATIONS_STORE = 'operations';
+const LEGACY_BLOBS_STORE = 'blobs';
 
 const DOWNLOAD_QUALITY = 240; // matches the player's default stream
 const CHUNK_BYTES = 2 * 1024 * 1024; // 2 MiB per bounded range request
@@ -102,11 +107,11 @@ function openDb() {
             if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
                 db.createObjectStore(CHUNKS_STORE, { keyPath: 'key' });
             }
-            // Schema changes stay additive; only the truly obsolete v1
-            // monolithic blob store is ever dropped (never completed v2
-            // downloads).
-            if (db.objectStoreNames.contains('blobs')) {
-                db.deleteObjectStore('blobs');
+            // A05: schema changes stay additive. The v1-era `blobs` store is
+            // PRESERVED — legacy monolithic downloads stay listed/playable
+            // and are removed only by explicit user deletion.
+            if (!db.objectStoreNames.contains(OPERATIONS_STORE)) {
+                db.createObjectStore(OPERATIONS_STORE, { keyPath: 'videoId' });
             }
         };
         request.onsuccess = () => resolve(request.result);
@@ -242,6 +247,133 @@ function deleteChunkRangeInTx(chunksStore, id) {
 }
 
 // ---------------------------------------------------------------------------
+// Durable download ownership — A03/A10
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-page-load instance identity. Two tabs of this app on one device must
+ * never both write the same video's chunks. Ownership is persisted in the
+ * `operations` store so it survives tab reloads and is FENCED by a heartbeat:
+ * a crashed/closed writer stops heartbeating and its claim expires, so a
+ * surviving context may resume instead of being locked out forever.
+ */
+const OWNER_HEARTBEAT_MS = 4_000;
+const OWNER_LIVENESS_MS = 15_000;
+const ownerInstance =
+    (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `inst-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+const ownerHeartbeats = new Map();
+
+function isForeignOwner(record) {
+    if (!record || record.owner === ownerInstance) return false;
+    // Liveness fencing only: a claim whose heartbeat stopped for longer than
+    // the liveness window belongs to a crashed/closed context and is
+    // re-claimable. A frozen (bfcache) writer that resumes after another
+    // context took over hits the fenced writes below and pauses cleanly —
+    // data stays consistent either way.
+    const heartbeatAt = Number(record.heartbeatAt) || 0;
+    return Date.now() - heartbeatAt < OWNER_LIVENESS_MS;
+}
+
+function ownerRecord(id, previous) {
+    return {
+        videoId: `owner:${id}`,
+        owner: ownerInstance,
+        acquiredAt: Date.now(),
+        heartbeatAt: Date.now(),
+        previousOwner: (previous && previous.owner) || null
+    };
+}
+
+/**
+ * Read the durable ownership record for `id`.
+ * @returns {Promise<{record: object|null, mine: boolean, foreign: boolean}>}
+ */
+async function readOwnership(id) {
+    let record = null;
+    try {
+        record = await getRecord(OPERATIONS_STORE, `owner:${id}`);
+    } catch {
+        record = null;
+    }
+    if (!record) return { record: null, mine: false, foreign: false };
+    if (record.owner === ownerInstance) return { record, mine: true, foreign: false };
+    return { record, mine: false, foreign: isForeignOwner(record) };
+}
+
+/**
+ * Take durable ownership of `id` (create/overwrite the record in one
+ * write transaction) and start the heartbeat. Returns false when another
+ * LIVE context owns the download — the caller must not write.
+ */
+async function claimOwnership(id) {
+    let previous = null;
+    try {
+        previous = await getRecord(OPERATIONS_STORE, `owner:${id}`);
+    } catch {
+        previous = null;
+    }
+    if (previous && isForeignOwner(previous)) return false;
+    try {
+        await withTransaction(OPERATIONS_STORE, 'readwrite', (tx) => {
+            tx.objectStore(OPERATIONS_STORE).put(ownerRecord(id, previous));
+        });
+    } catch {
+        // If we cannot persist the claim we must not silently compete.
+        return false;
+    }
+    startOwnerHeartbeat(id);
+    return true;
+}
+
+function startOwnerHeartbeat(id) {
+    stopOwnerHeartbeat(id);
+    const touch = () => {
+        withTransaction(OPERATIONS_STORE, 'readwrite', (tx) => {
+            const store = tx.objectStore(OPERATIONS_STORE);
+            const request = store.get(`owner:${id}`);
+            request.onsuccess = () => {
+                const record = request.result;
+                if (!record || record.owner !== ownerInstance) return;
+                record.heartbeatAt = Date.now();
+                store.put(record);
+            };
+        }).catch(() => {});
+    };
+    touch();
+    const timer = setInterval(touch, OWNER_HEARTBEAT_MS);
+    if (typeof timer === 'object' && timer && typeof timer.unref === 'function') timer.unref();
+    ownerHeartbeats.set(id, timer);
+}
+
+function stopOwnerHeartbeat(id) {
+    const timer = ownerHeartbeats.get(id);
+    if (timer) {
+        clearInterval(timer);
+        ownerHeartbeats.delete(id);
+    }
+}
+
+/** Release our durable ownership of `id` (only ever our own record). */
+async function releaseOwnership(id) {
+    stopOwnerHeartbeat(id);
+    try {
+        await withTransaction(OPERATIONS_STORE, 'readwrite', (tx) => {
+            const store = tx.objectStore(OPERATIONS_STORE);
+            const request = store.get(`owner:${id}`);
+            request.onsuccess = () => {
+                const record = request.result;
+                if (record && record.owner === ownerInstance) store.delete(`owner:${id}`);
+            };
+        });
+    } catch {
+        /* release is best-effort; the record expires via liveness */
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -271,6 +403,39 @@ function throttleProgress(id) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Read the v1 monolithic download for `id` from the preserved legacy
+ * `blobs` store (A05). Returns a modern-shaped ready record or null.
+ * Strictly validated: the row is skipped (never repaired, never deleted)
+ * when it does not carry a real Blob.
+ */
+async function getLegacyDownload(id) {
+    if (!id || typeof id !== 'string') return null;
+    try {
+        const row = await getRecord(LEGACY_BLOBS_STORE, id);
+        if (!isValidLegacyRow(row)) return null;
+        return legacyRecord(row);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * A05: explicit user removal reaches the preserved legacy store too. Only
+ * a user-initiated cancel/remove calls this — never an upgrade, never a
+ * repair. Best-effort: a failed legacy cleanup never reports failure for
+ * the modern deletion that already succeeded.
+ */
+async function deleteLegacyBlobRecord(id) {
+    try {
+        await withTransaction(LEGACY_BLOBS_STORE, 'readwrite', (tx) => {
+            tx.objectStore(LEGACY_BLOBS_STORE).delete(id);
+        });
+    } catch {
+        /* best-effort — the legacy row may already be gone */
+    }
+}
+
+/**
  * Metadata record for one video:
  * { id, title, author, thumbnail, duration, status: 'downloading'|'paused'|'ready',
  *   progress, totalBytes, completedBytes, chunkCount, mimeType, quality,
@@ -280,21 +445,91 @@ export async function getDownload(id) {
     if (!offlineSupported() || !id) return null;
     try {
         const record = await getRecord(VIDEOS_STORE, id);
-        return record ? withProgress(record) : null;
+        if (record) return withProgress(record);
+    } catch {
+        return null;
+    }
+    // A05: a v1-era download (monolithic Blob in the preserved legacy store)
+    // stays visible after the v3 upgrade.
+    const legacy = await getLegacyDownload(id);
+    return legacy ? withProgress(legacy) : null;
+}
+
+/**
+ * All download records (metadata only — chunks are never loaded here).
+ * A05: v1-era legacy downloads are appended from the preserved `blobs`
+ * store; a modern record for the same id always wins.
+ */
+export async function getDownloads() {
+    if (!offlineSupported()) return [];
+    try {
+        const records = (await getAllRecords(VIDEOS_STORE)) || [];
+        const modern = new Set(records.map((record) => record.id));
+        const legacyRows = (await getAllRecords(LEGACY_BLOBS_STORE).catch(() => [])) || [];
+        const legacy = legacyRows
+            .filter((row) => row && !modern.has(row.id) && isValidLegacyRow(row))
+            .map((row) => withProgress(legacyRecord(row)));
+        return records.map(withProgress).concat(legacy);
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * A05: build (and cache) a playback URL from the preserved v1 `blobs`
+ * store. Strictly validated — a corrupt row yields null, never a
+ * fabricated URL.
+ */
+async function playLegacyBlobUrl(id) {
+    try {
+        const row = await getRecord(LEGACY_BLOBS_STORE, id);
+        if (!isValidLegacyRow(row)) return null;
+        const url = URL.createObjectURL(row.blob);
+        urlCache.set(id, url);
+        return url;
     } catch {
         return null;
     }
 }
 
-/** All download records (metadata only — chunks are never loaded here). */
-export async function getDownloads() {
-    if (!offlineSupported()) return [];
-    try {
-        const records = (await getAllRecords(VIDEOS_STORE)) || [];
-        return records.map(withProgress);
-    } catch {
-        return [];
-    }
+/**
+ * Strict shape check for a legacy `blobs` row (A05): a row without a real
+ * Blob is reported absent — never fabricated, never auto-repaired.
+ */
+function isValidLegacyRow(row) {
+    if (!row || typeof row.id !== 'string') return false;
+    const blob = row.blob;
+    return (
+        !!blob &&
+        typeof blob.size === 'number' &&
+        typeof blob.slice === 'function' &&
+        typeof blob.arrayBuffer === 'function'
+    );
+}
+
+/** Modern-shaped ready record from a validated legacy `blobs` row. */
+function legacyRecord(row) {
+    return {
+        id: row.id,
+        title: typeof row.title === 'string' ? row.title : '',
+        author: typeof row.author === 'string' ? row.author : '',
+        thumbnail: '',
+        duration: 0,
+        status: 'ready',
+        totalBytes: row.blob.size,
+        completedBytes: row.blob.size,
+        chunkCount: 1,
+        mimeType: typeof row.mimeType === 'string' ? row.mimeType : 'video/mp4',
+        quality: 0,
+        pausedReason: null,
+        retryAfterEpoch: null,
+        etag: null,
+        etagStrong: false,
+        lastModified: null,
+        createdAt: Number(row.createdAt) || 0,
+        updatedAt: Number(row.updatedAt) || 0,
+        legacy: true
+    };
 }
 
 function withProgress(record) {
@@ -806,36 +1041,107 @@ function putVideoMeta(meta) {
 }
 
 /**
- * THE chunk transaction: writes the chunk record AND its updated video
- * metadata together across both stores. Resolves only on transaction
- * completion; rejects on error/abort.
+ * A03/A10 — fenced chunk commit. The ownership record is re-checked INSIDE
+ * the same transaction that writes the chunk: if another live context has
+ * taken ownership (or a cancellation released ours), the write aborts and
+ * nothing is committed. Sync-throwing inside the callback aborts the
+ * transaction, so data and fencing stay atomic. The ownership GET must be
+ * awaited (via the transaction promise) before any decision — a bare
+ * request.result is always undefined at callback time.
  */
-function writeChunkTransaction(id, meta, chunk) {
-    return withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
+function writeOwnedChunkTransaction(id, meta, chunk) {
+    return withTransaction([VIDEOS_STORE, CHUNKS_STORE, OPERATIONS_STORE], 'readwrite', (tx) => {
+        const ownership = tx.objectStore(OPERATIONS_STORE);
+        const recordRequest = ownership.get(`owner:${id}`);
         const videos = tx.objectStore(VIDEOS_STORE);
         const chunks = tx.objectStore(CHUNKS_STORE);
-        videos.put({ ...meta });
-        chunks.put({
-            key: chunk.key,
-            videoId: id,
-            index: chunk.index,
-            start: chunk.start,
-            end: chunk.end,
-            size: chunk.blob.size,
-            blob: chunk.blob
+        return wrapRequest(recordRequest).then((owned) => {
+            if (!owned || owned.owner !== ownerInstance) {
+                throw new Error('download ownership lost');
+            }
+            videos.put({ ...meta });
+            chunks.put({
+                key: chunk.key,
+                videoId: id,
+                index: chunk.index,
+                start: chunk.start,
+                end: chunk.end,
+                size: chunk.blob.size,
+                blob: chunk.blob
+            });
         });
     });
 }
 
-/** Awaited deletion of a video's records across both stores. */
-function deleteVideoData(id) {
-    revokeOfflineUrl(id);
-    return withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
+/**
+ * A03/A10 — fenced authoritative reset for the one permitted
+ * representation-change restart. Aborts when ownership was lost.
+ */
+async function resetForNewRepresentation(id, meta, etag, lastModified, total) {
+    await withTransaction([VIDEOS_STORE, CHUNKS_STORE, OPERATIONS_STORE], 'readwrite', (tx) => {
+        const ownership = tx.objectStore(OPERATIONS_STORE);
+        const recordRequest = ownership.get(`owner:${id}`);
         const videos = tx.objectStore(VIDEOS_STORE);
         const chunks = tx.objectStore(CHUNKS_STORE);
-        videos.delete(id);
-        deleteChunkRangeInTx(chunks, id);
+        return wrapRequest(recordRequest).then((owned) => {
+            if (!owned || owned.owner !== ownerInstance) {
+                throw new Error('download ownership lost');
+            }
+            deleteChunkRangeInTx(chunks, id);
+            const reset = {
+                ...meta,
+                status: 'downloading',
+                completedBytes: 0,
+                chunkCount: 0,
+                totalBytes: Number.isSafeInteger(total) && total > 0 ? total : 0,
+                etag: etag || null,
+                etagStrong: isStrongEtag(etag),
+                lastModified: lastModified || null,
+                updatedAt: Date.now()
+            };
+            videos.put(reset);
+        });
     });
+}
+
+/**
+ * A03/A10 — fenced per-video deletion in ONE atomic transaction. Only ever
+ * deletes a video's records when the durable ownership record permits it:
+ * absent (nothing running in any context), expired (the previous owner
+ * crashed), or owned by THIS context. A live foreign owner refuses the
+ * delete so two tabs can never tear each other's data down. The ownership
+ * check happens INSIDE the same transaction as the deletes, so a racing
+ * reader can never see a half-deleted video and the baseline's
+ * issue-order guarantee for same-context transactions is preserved.
+ * Returns true when deleted, false when refused by a live foreign owner.
+ */
+function deleteVideoDataFenced(id) {
+    return withTransaction([VIDEOS_STORE, CHUNKS_STORE, OPERATIONS_STORE], 'readwrite', (tx) => {
+        const ownership = tx.objectStore(OPERATIONS_STORE);
+        const recordRequest = ownership.get(`owner:${id}`);
+        const videos = tx.objectStore(VIDEOS_STORE);
+        const chunks = tx.objectStore(CHUNKS_STORE);
+        return wrapRequest(recordRequest).then((owned) => {
+            // Liveness-aware fencing: refuse only a LIVE foreign owner. An
+            // expired claim (crashed/closed context) is deletable — the
+            // delete also clears the stale record.
+            if (isForeignOwner(owned)) {
+                throw new Error('download owned by another live context');
+            }
+            revokeOfflineUrl(id);
+            videos.delete(id);
+            deleteChunkRangeInTx(chunks, id);
+            ownership.delete(`owner:${id}`);
+        });
+    }).then(
+        () => true,
+        (error) => {
+            if (error && error.message === 'download owned by another live context') {
+                return false;
+            }
+            throw error;
+        }
+    );
 }
 
 function chunkKey(id, index) {
@@ -857,20 +1163,27 @@ export async function offlinePlayUrl(id) {
     if (existing) return existing;
     try {
         const record = await getRecord(VIDEOS_STORE, id);
-        if (!record || record.status !== 'ready') return null;
-        const total = record.totalBytes;
-        if (!Number.isSafeInteger(total) || total <= 0) return null;
-        const { chunks, validThrough } = await loadValidatedChunks(id);
-        if (validThrough !== total - 1 || chunks.length === 0) return null;
-        const parts = chunks.map((chunk) => chunk.blob);
-        const blob = new Blob(parts, { type: record.mimeType || 'video/mp4' });
-        if (blob.size !== total) return null;
-        const url = URL.createObjectURL(blob);
-        urlCache.set(id, url);
-        return url;
+        if (record && record.status === 'ready') {
+            const total = record.totalBytes;
+            if (Number.isSafeInteger(total) && total > 0) {
+                const { chunks, validThrough } = await loadValidatedChunks(id);
+                if (validThrough === total - 1 && chunks.length > 0) {
+                    const parts = chunks.map((chunk) => chunk.blob);
+                    const blob = new Blob(parts, { type: record.mimeType || 'video/mp4' });
+                    if (blob.size === total) {
+                        const url = URL.createObjectURL(blob);
+                        urlCache.set(id, url);
+                        return url;
+                    }
+                }
+            }
+        }
     } catch {
         return null;
     }
+    // A05: v1 monolithic downloads stay byte-playable after the v3 upgrade
+    // through the preserved legacy store.
+    return playLegacyBlobUrl(id);
 }
 
 export function revokeOfflineUrl(id) {
@@ -914,26 +1227,70 @@ export async function startDownload(video) {
     }
 
     const op = new Operation(id);
+    // A03/A10 race fix: the settlement promise exists SYNCHRONOUSLY at
+    // registration. A cancel racing this start can then always await the
+    // operation's REAL settlement (abort → cleanup → ownership release)
+    // before it deletes records — the baseline's cancel-then-delete
+    // ordering survives the new async ownership-claim window.
+    let settle;
+    let fail;
+    const settled = new Promise((resolve, reject) => {
+        settle = resolve;
+        fail = reject;
+    });
+    op.done = settled;
     operations.set(id, op);
-    op.done = (async () => {
+
+    // A03/A10: durable ownership across browser contexts. If another LIVE
+    // tab (or a reloaded page of the same SPA) owns this download, this
+    // context reports the already-downloading state instead of spawning a
+    // rival writer. A dead claim (heartbeat expired) is re-claimed.
+    let owns = true;
+    try {
+        const current = await readOwnership(id);
+        owns = current.foreign ? false : await claimOwnership(id);
+    } catch {
+        owns = false;
+    }
+    if (!owns) {
+        if (operations.get(id) === op) operations.delete(id);
+        settle({ id, status: 'downloading', ownedByOtherContext: true });
+        return { id, status: 'downloading', ownedByOtherContext: true };
+    }
+    // Cancelled while the claim was being taken: release the claim and bail
+    // out before any writer work begins.
+    if (op.controller.signal.aborted) {
+        await releaseOwnership(id);
+        if (operations.get(id) === op) operations.delete(id);
+        fail(abortError());
+        throw abortError();
+    }
+    (async () => {
         try {
-            return await runDownload(video, op);
+            const result = await runDownload(video, op);
+            settle(result);
         } catch (error) {
             if (isAbort(error) || op.controller.signal.aborted) {
-                throw abortError();
+                // Cancellation: records are torn down by cancelDownload's
+                // awaited delete, never by the writer itself.
+                fail(abortError());
+            } else {
+                // Network loss / quota / repeated chunk failure: keep
+                // partial data and mark paused with accurate metadata.
+                await pauseWithError(id, op, error).catch(() => {});
+                settle({ id, status: 'paused' });
             }
-            // Network loss / quota / repeated chunk failure: keep partial
-            // data and mark the download paused with accurate metadata.
-            await pauseWithError(id, op, error).catch(() => {});
-            return { id, status: 'paused' };
         } finally {
             // Finalizers delete the map entry only if it still belongs to
             // this operation (never a newer controller).
             if (operations.get(id) === op) operations.delete(id);
             lastEmit.delete(id);
+            // A03/A10: the durable claim is released in every exit path so
+            // a live context can resume immediately after this one settles.
+            releaseOwnership(id);
         }
     })();
-    return op.done;
+    return settled;
 }
 
 async function pauseWithError(id, op, error) {
@@ -1080,25 +1437,9 @@ async function runDownload(video, op) {
         }
         sourceRestarts++;
         // Discard only this video's partial chunks + revoke its cached
-        // playback URL, then atomically reset progress/metadata.
-        revokeOfflineUrl(id);
-        await withTransaction([VIDEOS_STORE, CHUNKS_STORE], 'readwrite', (tx) => {
-            const videos = tx.objectStore(VIDEOS_STORE);
-            const chunks = tx.objectStore(CHUNKS_STORE);
-            deleteChunkRangeInTx(chunks, id);
-            const reset = {
-                ...meta,
-                status: 'downloading',
-                completedBytes: 0,
-                chunkCount: 0,
-                totalBytes: Number.isSafeInteger(total) && total > 0 ? total : 0,
-                etag: etag || null,
-                etagStrong: isStrongEtag(etag),
-                lastModified: lastModified || null,
-                updatedAt: Date.now()
-            };
-            videos.put(reset);
-        });
+        // playback URL, then atomically reset progress/metadata — fenced
+        // against a lost ownership claim (A03/A10).
+        await resetForNewRepresentation(id, meta, etag, lastModified, total);
         offset = 0;
         nextChunkIndex = 0;
         knownTotal = Number.isSafeInteger(total) && total > 0 ? total : null;
@@ -1200,8 +1541,9 @@ async function runDownload(video, op) {
         meta.status = 'downloading';
         meta.updatedAt = Date.now();
 
-        // Persist the chunk + its updated metadata as ONE transaction.
-        await writeChunkTransaction(id, meta, {
+        // Persist the chunk + its updated metadata as ONE transaction,
+        // fenced against a lost ownership claim (A03/A10).
+        await writeOwnedChunkTransaction(id, meta, {
             key: chunkKey(id, nextChunkIndex),
             index: nextChunkIndex,
             start: respStart,
@@ -1275,10 +1617,24 @@ export async function cancelDownload(id) {
     if (operation) {
         if (!operation.controller.signal.aborted) operation.controller.abort();
         if (operation.done) {
+            // A03/A10 race fix: op.done exists from the synchronously
+            // registered deferred promise, so this ALWAYS awaits the real
+            // settlement (abort → cleanup → ownership release) before the
+            // delete below — no window where delete runs before cleanup.
             await operation.done.catch(() => {});
         }
     }
-    await deleteVideoData(id);
+    // A03/A10: refuse to tear down data while ANOTHER live context owns
+    // the download — a second tab cannot abort a foreign writer or delete
+    // its partial chunks. This context's own claim (or an absent/expired
+    // one) deletes. Explicit user intent also reaches the preserved v1
+    // legacy `blobs` store.
+    const fenced = await deleteVideoDataFenced(id);
+    if (!fenced) {
+        emitChanged(id);
+        return;
+    }
+    await deleteLegacyBlobRecord(id);
     lastEmit.delete(id);
     emitChanged(id);
 }
@@ -1290,7 +1646,12 @@ export async function removeDownload(id) {
         await cancelDownload(id);
         return;
     }
-    await deleteVideoData(id);
+    const fenced = await deleteVideoDataFenced(id);
+    if (!fenced) {
+        emitChanged(id);
+        return;
+    }
+    await deleteLegacyBlobRecord(id);
     lastEmit.delete(id);
     emitChanged(id);
 }

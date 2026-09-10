@@ -227,11 +227,13 @@ function rangeServer(source, opts = {}) {
 // ---------------------------------------------------------------------------
 
 const DB_NAME = 'yt-offline-db'
-const DB_VERSION = 2
+// Versionless raw opens: the production service owns the schema version
+// (v3 since the durable-ownership migration). Opening raw with a pinned
+// lower version would fail once the service has upgraded the database.
 
 function rawOpen() {
     return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION)
+        const request = indexedDB.open(DB_NAME)
         request.onupgradeneeded = () => {
             const db = request.result
             if (!db.objectStoreNames.contains('videos')) db.createObjectStore('videos', { keyPath: 'id' })
@@ -240,6 +242,116 @@ function rawOpen() {
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
     })
+}
+
+/**
+ * Seed a GENUINE legacy v2 database (no `operations` store, plus a v1-era
+ * `blobs` row) and close it, so the production service performs the real
+ * v2→v3 upgrade against it.
+ */
+async function seedLegacyV2Database(id, { blobBytes, meta = {}, legacy = {} } = {}) {
+    const existing = await indexedDB.databases().catch(() => [])
+    const present = Array.isArray(existing) && existing.some((d) => d && d.name === DB_NAME)
+    if (present) {
+        await new Promise((resolve, reject) => {
+            const request = indexedDB.deleteDatabase(DB_NAME)
+            request.onsuccess = () => resolve()
+            request.onerror = () => reject(request.error)
+            request.onblocked = () => resolve()
+        })
+    }
+    const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 2)
+        request.onupgradeneeded = () => {
+            const upgraded = request.result
+            if (!upgraded.objectStoreNames.contains('videos')) upgraded.createObjectStore('videos', { keyPath: 'id' })
+            if (!upgraded.objectStoreNames.contains('chunks')) upgraded.createObjectStore('chunks', { keyPath: 'key' })
+            if (legacy.blob) {
+                upgraded.createObjectStore('blobs', { keyPath: 'id' })
+            }
+        }
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+    })
+    try {
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction(
+                legacy.blob ? ['videos', 'blobs'] : 'videos',
+                'readwrite'
+            )
+            if (legacy.blob) {
+                tx.objectStore('blobs').put({
+                    id,
+                    blob: new Blob(legacy.blob, { type: legacy.mime || 'video/mp4' }),
+                    title: legacy.title || '',
+                    author: legacy.author || '',
+                    mimeType: legacy.mime || 'video/mp4',
+                    createdAt: legacy.createdAt || 0,
+                    updatedAt: legacy.updatedAt || 0
+                })
+            }
+            if (meta) {
+                tx.objectStore('videos').put({ id, ...meta })
+            }
+            tx.oncomplete = () => resolve()
+            tx.onerror = () => reject(tx.error)
+            tx.onabort = () => reject(tx.error || new Error('seed aborted'))
+        })
+    } finally {
+        db.close()
+    }
+}
+
+async function rawObjectStoreNames() {
+    const db = await rawOpen()
+    try {
+        return Array.from(db.objectStoreNames)
+    } finally {
+        db.close()
+    }
+}
+
+async function rawLegacyRow(id) {
+    const db = await rawOpen()
+    try {
+        return await new Promise((resolve, reject) => {
+            const tx = db.transaction('blobs', 'readonly')
+            const req = tx.objectStore('blobs').get(id)
+            req.onsuccess = () => resolve(req.result || null)
+            req.onerror = () => reject(req.error)
+        })
+    } finally {
+        db.close()
+    }
+}
+
+async function rawOwnerRow(id) {
+    const db = await rawOpen()
+    try {
+        return await new Promise((resolve, reject) => {
+            const tx = db.transaction('operations', 'readonly')
+            const req = tx.objectStore('operations').get(`owner:${id}`)
+            req.onsuccess = () => resolve(req.result || null)
+            req.onerror = () => reject(req.error)
+        })
+    } finally {
+        db.close()
+    }
+}
+
+async function rawPutOwnerRow(id, record) {
+    const db = await rawOpen()
+    try {
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction('operations', 'readwrite')
+            tx.objectStore('operations').put({ videoId: `owner:${id}`, ...record })
+            tx.oncomplete = () => resolve()
+            tx.onerror = () => reject(tx.error)
+            tx.onabort = () => reject(tx.error || new Error('put aborted'))
+        })
+    } finally {
+        db.close()
+    }
 }
 
 async function rawChunks(id) {

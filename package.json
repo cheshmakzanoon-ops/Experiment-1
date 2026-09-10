@@ -18,6 +18,7 @@
     "pretest": "node scripts/build-shell-manifest.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser": "playwright test",
     "lint": "eslint src/frontend --max-warnings=0",
     "lint:all": "npm run lint && npm run typecheck",
     "shell:manifest": "node scripts/build-shell-manifest.mjs",
@@ -29,6 +30,7 @@
     "undici": "^6.21.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.49.1",
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
     "fake-indexeddb": "6.2.5",

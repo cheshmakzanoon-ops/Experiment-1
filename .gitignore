@@ -8,6 +8,10 @@ dist/
 # Downloaded runtime binaries (yt-dlp) — never commit binaries
 .runtime/
 
+# Playwright test artifacts (browser fixtures are generated per-run)
+.runtime/playwright-artifacts/
+test-results/
+
 # Environment files (never commit secrets)
 .env
 .env.*
