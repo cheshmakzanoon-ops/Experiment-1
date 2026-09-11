@@ -30,6 +30,7 @@ import {
   SessionStoreError
 } from '../middleware/session.js'
 import { clientIp, RateLimiter } from '../middleware/rateLimit.js'
+import { readBoundedJson } from '../middleware/boundedBody.js'
 import { SessionStoreFullError } from '../services/sessionStore.js'
 
 const sessionRoutes = new Hono()
@@ -105,12 +106,11 @@ sessionRoutes.post('/session', async (c) => {
     )
   }
 
-  let body: { key?: unknown }
-  try {
-    body = await c.req.json()
-  } catch {
-    return c.json({ error: 'Invalid JSON body', code: 'BAD_REQUEST' }, 400)
-  }
+  // Bounded read (A02): the login endpoint is public — an oversized body is
+  // rejected 413 without ever being buffered or parsed.
+  const bodyResult = await readBoundedJson<{ key?: unknown }>(c)
+  if (!bodyResult.ok) return bodyResult.response
+  const body = bodyResult.value
 
   const provided = typeof body.key === 'string' ? body.key : ''
   if (!provided) {

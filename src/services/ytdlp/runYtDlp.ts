@@ -290,6 +290,8 @@ function spawnYtDlpProcess(userArgs: string[], options: SpawnOptions): Promise<S
     let cleaned = false
     let stdoutOverflow = false
     let killTimer: ReturnType<typeof setTimeout> | null = null
+    /** Bounded accumulation (A04): once the cap is hit, chunks are counted, not stored. */
+    let overflowDroppedBytes = 0
 
     const cleanup = () => {
       if (cleaned) return
@@ -322,9 +324,22 @@ function spawnYtDlpProcess(userArgs: string[], options: SpawnOptions): Promise<S
 
     child.stdout?.on('data', (chunk: Buffer) => {
       if (settled) return
+      if (stdoutOverflow) {
+        // Post-cap accounting only (A04): never append while waiting for the
+        // terminated child to exit, or an oversized-output child that
+        // ignores SIGTERM can still drain unbounded memory into `stdout`.
+        overflowDroppedBytes += chunk.byteLength
+        if (overflowDroppedBytes > maxBuffer) {
+          terminateChild(record)
+          killTimer = setTimeout(() => terminateChild(record), 1000)
+          killTimer.unref?.()
+        }
+        return
+      }
       stdout += chunk.toString('utf8')
       if (stdout.length > maxBuffer) {
         stdoutOverflow = true
+        stdout = ''
         terminateChild(record)
       }
     })

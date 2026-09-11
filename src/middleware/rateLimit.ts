@@ -8,14 +8,18 @@
  *
  *   - each limiter instance owns its own cleanup (timer + lazy pruning), so
  *     stale keys cannot accumulate and no unrelated global is involved,
- *   - client identity is derived safely: X-Forwarded-For is ONLY trusted
- *     when TRUST_PROXY=true (Freebuff sits behind a reverse proxy, but a
- *     user-controlled header must never become a security boundary),
+ *   - client identity is derived safely: under TRUST_PROXY=true the
+ *     RIGHTMOST entry of X-Forwarded-For is used — reverse proxies APPEND
+ *     the connecting peer's address, so everything to the left is
+ *     client-controlled and must never become a security boundary. Every
+ *     candidate is validated as a bare IP literal; junk fails closed to the
+ *     actual socket address (or null), never to attacker-chosen text.
  *   - when a valid household session exists, the limit keys on the session
  *     id instead of an IP (household devices behind NAT share one IP),
  *   - responses carry an accurate `Retry-After`.
  */
 
+import { isIP } from 'node:net'
 import type { Context, MiddlewareHandler } from 'hono'
 import { config } from '../config.js'
 import { currentSession } from './session.js'
@@ -33,16 +37,41 @@ export interface RateLimitOptions {
   name?: string
 }
 
+/**
+ * Bare IP literal (IPv4 or any IPv6 form, no port, no brackets, no junk).
+ * A valid socket address that is not a bare literal (e.g. `1.2.3.4:8443`)
+ * is NOT accepted as an identity.
+ */
+export function isPlainIpLiteral(value: string): boolean {
+  if (!value || value.length > 45) return false
+  return isIP(value) !== 0
+}
+
+/**
+ * The proxy-added (rightmost) X-Forwarded-For entry — the only part of the
+ * chain the client cannot choose. Strictly rightmost: if that entry is not
+ * a bare IP literal the header cannot become an identity (fail closed).
+ * Skipping leftward would trust a client-controlled entry when a hop sent
+ * junk (`9.9.9.9, garbage` must not yield 9.9.9.9).
+ */
+function rightmostProxyAddedEntry(forwarded: string): string | null {
+  const parts = forwarded.split(',')
+  const last = parts[parts.length - 1]?.trim() ?? ''
+  return isPlainIpLiteral(last) ? last : null
+}
+
 /** Client IP used only for anonymous (pre-session) limits. */
 export function clientIp(c: Context): string | null {
   if (config.trustProxy) {
     const forwarded = c.req.header('x-forwarded-for')
     if (forwarded) {
-      const first = forwarded.split(',')[0]?.trim()
-      if (first) return first
+      const proxyAdded = rightmostProxyAddedEntry(forwarded)
+      if (proxyAdded) return proxyAdded
+      // No valid IP literal anywhere in the chain: the header cannot become
+      // an identity. Fall through to the real socket address.
     }
     const realIp = c.req.header('x-real-ip')
-    if (realIp) return realIp
+    if (realIp && isPlainIpLiteral(realIp.trim())) return realIp.trim()
   }
   // @hono/node-server exposes the raw node request on c.env.incoming (the
   // env object is absent under Hono's test harness and some runtimes).

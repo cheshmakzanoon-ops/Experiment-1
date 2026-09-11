@@ -68,6 +68,53 @@ function seedStreamCache(videoId: string, maxHeight: number, v: VideoMetadata): 
   })
 }
 
+// Thumbnails are small (tens of KB); 2 MiB is a generous cap that still
+// accepts every real mqdefault/sddefault image. An upstream that streams
+// past this bound is cancelled — never buffered.
+const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
+
+/**
+ * Bounded read (A04): cap the upstream body read, cancel the remainder, and
+ * fail with a controlled 502 instead of buffering an unbounded network
+ * stream. A declared Content-Length above the cap is refused before any
+ * byte is read.
+ */
+async function readBoundedThumbnail(
+  upstream: Response,
+  limitBytes: number
+): Promise<{ ok: true; bytes: Buffer } | { ok: false; reason: 'too_large' | 'read_error' }> {
+  const declared = upstream.headers.get('content-length')
+  if (declared !== null && declared !== '') {
+    const size = Number(declared)
+    if (Number.isFinite(size) && size > limitBytes) {
+      await upstream.body?.cancel().catch(() => {})
+      return { ok: false, reason: 'too_large' }
+    }
+  }
+
+  if (!upstream.body) return { ok: false, reason: 'read_error' }
+
+  const reader = upstream.body.getReader()
+  const chunks: Uint8Array[] = []
+  let received = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += value.byteLength
+      if (received > limitBytes) {
+        await reader.cancel('thumbnail body limit exceeded').catch(() => {})
+        return { ok: false, reason: 'too_large' }
+      }
+      chunks.push(value)
+    }
+  } catch {
+    await reader.cancel().catch(() => {})
+    return { ok: false, reason: 'read_error' }
+  }
+  return { ok: true, bytes: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))) }
+}
+
 function metadataFailure(error: unknown): { status: number; body: Record<string, string> } {
   if (error instanceof QueueFullError || error instanceof QueueTimeoutError) {
     return { status: 503, body: { error: 'Server is busy — try again shortly', code: 'SERVER_BUSY' } }
@@ -135,10 +182,12 @@ videoRoutes.get('/video/:id/thumbnail', async (c) => {
     if (!upstream.ok) {
       return c.json({ error: 'Thumbnail unavailable from upstream', code: 'UPSTREAM_ERROR' }, 502)
     }
-    // Thumbnails are small (tens of KB); buffering one is acceptable.
-    const arrayBuffer = await upstream.arrayBuffer()
-    memoryCache.set(cacheKey, Buffer.from(arrayBuffer), 86_400_000)
-    return serveThumbnail(c, Buffer.from(arrayBuffer))
+    const bounded = await readBoundedThumbnail(upstream, THUMBNAIL_MAX_BYTES)
+    if (!bounded.ok) {
+      return c.json({ error: 'Thumbnail unavailable from upstream', code: 'UPSTREAM_ERROR' }, 502)
+    }
+    memoryCache.set(cacheKey, bounded.bytes, 86_400_000)
+    return serveThumbnail(c, bounded.bytes)
   } catch {
     return c.json({ error: 'Failed to fetch thumbnail', code: 'UPSTREAM_ERROR' }, 502)
   }
