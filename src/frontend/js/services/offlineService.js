@@ -859,6 +859,11 @@ async function fetchSingleRange(streamUrl, start, end, signal) {
 
     if (status === 401 && sessionEnforced()) {
         await response.body?.cancel?.().catch(() => {});
+        // R5: a downloader 401 must OPEN the shared gate (initiating the
+        // household login) — not merely append a waiter for a gate that may
+        // never exist. Fire-and-forget: this chunk throws unauthorized; the
+        // caller's waitForGateOrAbort subscribes to the same shared promise.
+        void waitForGateOrAbort(signal).catch(() => {});
         throw new ApiError('unauthorized', { status: 401 });
     }
     if (status === 416) {

@@ -23,6 +23,11 @@ export interface StreamSelection {
   hasAudio: boolean
   hasVideo: boolean
   formatId: string
+  /** Raw codec identifiers (R1: tracked internally, never re-guessed). */
+  vcodec?: string
+  acodec?: string
+  /** Estimated total bitrate (kbit/s) — R2 tie-breaker bookkeeping. */
+  tbr?: number
 }
 
 export interface StreamMeta {

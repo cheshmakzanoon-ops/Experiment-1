@@ -26,6 +26,15 @@ interface PublicVideoInfo {
   uploadDate: string
   /** Our proxy URL (relative, same-origin). */
   streamUrl: string
+  // ---- R2 additive playback-truth metadata (no signed upstream URLs) ----
+  requestedQuality: string
+  actualQuality: string
+  hasAudio: boolean
+  hasVideo: boolean
+  mimeType: string
+  codecs: { video?: string; audio?: string }
+  availableQualities: Array<{ height?: number; label: string; mimeType: string; formatId?: string }>
+  selectionReason: string
 }
 
 function toPublicVideoInfo(videoId: string, quality: string, v: VideoMetadata): PublicVideoInfo {
@@ -39,7 +48,15 @@ function toPublicVideoInfo(videoId: string, quality: string, v: VideoMetadata): 
     authorId: v.authorId,
     viewCount: v.viewCount,
     uploadDate: v.uploadDate,
-    streamUrl: `/api/stream/${videoId}?quality=${quality}`
+    streamUrl: `/api/stream/${videoId}?quality=${quality}`,
+    requestedQuality: v.requestedQuality ?? `${quality}p`,
+    actualQuality: v.actualQuality ?? v.formats?.[0]?.quality ?? `${quality}p`,
+    hasAudio: v.hasAudio ?? false,
+    hasVideo: v.hasVideo ?? false,
+    mimeType: v.mimeType ?? v.formats?.[0]?.mimeType ?? 'video/mp4',
+    codecs: v.codecs ?? { video: v.formats?.[0]?.vcodec, audio: v.formats?.[0]?.acodec },
+    availableQualities: v.availableQualities ?? [],
+    selectionReason: v.selectionReason ?? 'extraction'
   }
 }
 
@@ -60,6 +77,8 @@ function seedStreamCache(videoId: string, maxHeight: number, v: VideoMetadata): 
     hasAudio: format.hasAudio,
     hasVideo: format.hasVideo,
     formatId: format.formatId || format.quality,
+    vcodec: format.vcodec,
+    acodec: format.acodec,
     title: v.title,
     author: v.author,
     duration: v.duration,

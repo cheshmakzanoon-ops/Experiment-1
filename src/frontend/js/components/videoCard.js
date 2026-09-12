@@ -138,6 +138,12 @@ export function createVideoCard(videoData, onVideoClick) {
     card.appendChild(content);
 
     card.addEventListener('click', () => {
+        // R1: live cards are visibly nonplayable — explain before any stream
+        // request so extraction is never attempted against a live source.
+        if (videoData.isLive) {
+            showToast('پخش زنده پشتیبانی نمی‌شود — پخش ویدیوهای ضبط‌شده فعال است');
+            return;
+        }
         if (typeof onVideoClick === 'function') {
             onVideoClick(videoData);
         }

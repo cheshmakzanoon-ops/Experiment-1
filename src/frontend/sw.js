@@ -40,10 +40,17 @@ const CORE_CACHE = `yt-core-${SHELL_GENERATION}`;
 const RUNTIME_CACHE = `yt-runtime-${SHELL_GENERATION}`;
 
 // Finite slow-network budget for app-shell (navigate/document) requests.
+// The deadline covers the COMPLETE bounded body read, not merely the
+// response headers (R5): a server that flushes 200 headers and then stalls
+// mid-body must hand control to the cached shell instead of hanging the
+// navigation forever.
 const SHELL_NETWORK_TIMEOUT_MS = 4000;
 // Per-resource fetch budget for precache: required files must neither hang
-// forever nor get abandoned while still readable on a 1–2 Mbps link.
+// forever nor get abandoned while still readable on a 1–2 Mbps link. The
+// budget includes CONSUMING the body (cache.put validates completion).
 const PRECACHE_TIMEOUT_MS = 30_000;
+/** Shell body cap: every real shell asset is far below 2 MiB. */
+const SHELL_BODY_CAP_BYTES = 2 * 1024 * 1024;
 
 self.addEventListener('install', (event) => {
     event.waitUntil(installShell());
@@ -60,6 +67,7 @@ async function installShell() {
     try {
         for (const path of SHELL_PATHS) {
             const request = path === '/' ? '/index.html' : path;
+            const startedAt = Date.now();
             let response = null;
             try {
                 response = await fetchWithTimeout(request);
@@ -75,8 +83,21 @@ async function installShell() {
                 if (response) await response.body?.cancel?.().catch(() => {});
                 throw new Error(`Shell precache failed for ${path}: HTTP ${response ? response.status : 'no response'}`);
             }
-            // Consume-and-store: cache.put validates the body can be read.
-            await cache.put(request, response);
+            // Consume-and-store under ONE total budget: headers + the full
+            // bounded body read. A candidate whose body stalls or truncates
+            // never reaches cache.put (old generation survives untouched).
+            try {
+                const bytes = await readBodyBounded(response, startedAt + PRECACHE_TIMEOUT_MS);
+                const complete = new Response(bytes, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                });
+                await cache.put(request, complete);
+            } catch (bodyError) {
+                await response.body?.cancel?.().catch(() => {});
+                throw new Error(`Shell precache failed for ${path}: ${bodyError instanceof Error ? bodyError.message : 'body read error'}`);
+            }
         }
         await self.skipWaiting();
     } catch (error) {
@@ -92,6 +113,45 @@ function fetchWithTimeout(resource) {
     return fetch(resource, { cache: 'no-cache', signal: controller.signal }).finally(
         () => clearTimeout(timer)
     );
+}
+
+/**
+ * Bounded body consumption (R5): read the ENTIRE body under a total
+ * deadline, a byte cap and a header deadline. Resolves with the fully-read
+ * bytes, or throws — a partially-read body is never returned.
+ */
+async function readBodyBounded(response, deadlineAt) {
+    const declared = Number(response.headers.get('Content-Length'));
+    if (Number.isFinite(declared) && declared > SHELL_BODY_CAP_BYTES) {
+        await response.body.cancel().catch(() => {});
+        throw new Error(`body exceeds ${SHELL_BODY_CAP_BYTES} bytes`);
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+        for (;;) {
+            if (Date.now() > deadlineAt) throw new Error('body deadline exceeded');
+            const result = await reader.read();
+            if (result.done) break;
+            received += result.value.byteLength;
+            if (received > SHELL_BODY_CAP_BYTES) {
+                await reader.cancel('body cap exceeded').catch(() => {});
+                throw new Error(`body exceeds ${SHELL_BODY_CAP_BYTES} bytes`);
+            }
+            chunks.push(result.value);
+        }
+    } catch (error) {
+        await reader.cancel().catch(() => {});
+        throw error;
+    }
+    const out = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return out;
 }
 
 self.addEventListener('activate', (event) => {
@@ -147,24 +207,42 @@ function cachePut(request, response) {
 }
 
 /**
- * Network first with a finite timeout; the cached copy is the fallback.
- * Failed candidates (gateway errors, wrong content type for scripts,
- * truncated bodies) are NEVER stored and NEVER served as the fresh copy —
- * the verified cached shell serves instead.
+ * Network first with a finite timeout covering the COMPLETE bounded body
+ * (R5). The deadline is checked against the total budget, not cleared when
+ * headers arrive: a 200 whose body stalls mid-flight is cancelled and the
+ * last complete matching cached resource is served instead. Failed
+ * candidates (gateway errors, wrong content type, truncated bodies) are
+ * NEVER stored and NEVER served as the fresh copy.
  */
 function networkFirst(request, fallbackPath, timeoutMs = SHELL_NETWORK_TIMEOUT_MS) {
     return new Promise((resolve) => {
         const controller = new AbortController();
+        const deadlineAt = Date.now() + timeoutMs;
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+        timer.unref?.();
 
         fetch(request, { signal: controller.signal })
-            .then((response) => {
-                clearTimeout(timer);
+            .then(async (response) => {
                 if (networkCandidateIsUsable(request, response)) {
-                    cachePut(request, response).finally(() => resolve(response));
+                    try {
+                        // Bounded body: the deadline (and byte cap) survives
+                        // header arrival. A stalled/truncated candidate is
+                        // cancelled and replaced by the cached shell.
+                        const bytes = await readBodyBounded(response, deadlineAt);
+                        const complete = new Response(bytes, {
+                            status: response.status,
+                            statusText: response.statusText,
+                            headers: response.headers
+                        });
+                        await cachePut(request, complete);
+                        resolve(complete);
+                    } catch {
+                        await response.body?.cancel?.().catch(() => {});
+                        fromCache(request, fallbackPath).then(resolve);
+                    }
                 } else {
                     // A 502/503/504 HTML error page is not our shell.
-                    response.body?.cancel?.().catch(() => {});
+                    await response.body?.cancel?.().catch(() => {});
                     fromCache(request, fallbackPath).then(resolve);
                 }
             })

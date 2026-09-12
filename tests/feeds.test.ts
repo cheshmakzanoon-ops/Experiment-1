@@ -15,7 +15,13 @@ vi.mock('../src/services/ytdlp/runYtDlp.js', () => {
 })
 
 import { runYtDlp } from '../src/services/ytdlp/runYtDlp.js'
-import { buildYtSearchString, getCategories, getTrendingForCategory } from '../src/services/youtube/trendingService.js'
+import {
+  buildYtSearchString,
+  getCategories,
+  getTrendingForCategory,
+  getHomeFeed,
+  UpstreamOutageError
+} from '../src/services/youtube/trendingService.js'
 import { staleCache, loadWithStale } from '../src/services/cache/staleCache.js'
 
 const BATCH = 45
@@ -142,5 +148,80 @@ describe('stale-if-error (search/feed refresh must not blank the UI)', () => {
   it('propagates the error when no stale data exists (fresh failure)', async () => {
     const producer = vi.fn().mockRejectedValue(new Error('booom'))
     await expect(loadWithStale('feed:news', 0, producer, { staleTtlMs: 60000 })).rejects.toThrow('booom')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// R6 — upstream outage must not erase the homepage.
+// ---------------------------------------------------------------------------
+
+describe('R6 home feed outage semantics', () => {
+  function mockHomeBatches(spec: Array<number | Error>) {
+    let call = 0
+    vi.mocked(runYtDlp).mockImplementation(async () => {
+      const item = spec[Math.min(call++, spec.length - 1)]
+      if (item instanceof Error) throw item
+      return { stdout: JSON.stringify({ entries: Array.from({ length: item }, (_, i) => entry(i + call * 100)) }), stderr: '' }
+    })
+  }
+
+  it('cold cache + all categories failing → classified error, never an empty 200', async () => {
+    staleCache.clear()
+    mockHomeBatches([new Error('Sign in to confirm you are not a bot')])
+    await expect(getHomeFeed(1, 12)).rejects.toBeInstanceOf(UpstreamOutageError)
+  })
+
+  it('outage-produced empty array is never cached (immediate recovery)', async () => {
+    staleCache.clear()
+    // First: every category fails. Then upstream recovers — the very next
+    // request must serve videos (no 15-minute poisoned empty page).
+    mockHomeBatches([new Error('upstream down')])
+    await expect(getHomeFeed(1, 12)).rejects.toBeInstanceOf(UpstreamOutageError)
+    mockHomeBatches([5])
+    const page = await getHomeFeed(1, 12)
+    expect(page.videos.length).toBeGreaterThan(0)
+  })
+
+  it('warm stale canonical + failing refresh → prior videos served, not empty', async () => {
+    staleCache.clear()
+    mockHomeBatches([5])
+    const good = await getHomeFeed(1, 12)
+    expect(good.videos.length).toBeGreaterThan(0)
+
+    // The canonical home batch TTL is 15 min; force the refresh by clearing
+    // ONLY the per-category home batches, not the canonical value.
+    mockHomeBatches([new Error('upstream down')])
+    staleCache.delete('home:canonical') // force a refresh attempt
+    const stale = await getHomeFeed(1, 12)
+    expect(stale.videos.length).toBe(good.videos.length)
+  })
+
+  it('one category success retains useful interleaved content', async () => {
+    staleCache.clear()
+    // HOME_CATEGORIES_PER_REFRESH=3 categories are queried per refresh.
+    mockHomeBatches([new Error('fail'), 6, new Error('fail')])
+    const page = await getHomeFeed(1, 12)
+    expect(page.videos.length).toBe(6)
+  })
+
+  it('deduplicates ids across category batches', async () => {
+    staleCache.clear()
+    // Same entries (same ids) in every successful batch → no duplicates.
+    vi.mocked(runYtDlp).mockImplementation(async () => ({
+      stdout: JSON.stringify({ entries: Array.from({ length: 6 }, (_, i) => entry(i)) }),
+      stderr: ''
+    }))
+    const page = await getHomeFeed(1, 12)
+    const ids = page.videos.map((v) => v.id)
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('beyond-batch page returns empty with hasMore=false (no page-1 fallback)', async () => {
+    staleCache.clear()
+    mockHomeBatches([5])
+    await getHomeFeed(1, 12)
+    const beyond = await getHomeFeed(99, 12)
+    expect(beyond.videos).toEqual([])
+    expect(beyond.hasMore).toBe(false)
   })
 })

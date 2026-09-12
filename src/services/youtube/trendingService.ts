@@ -63,7 +63,8 @@ export const CATEGORIES: Category[] = [
   { id: 'all', nameFa: 'همه', nameEn: 'All', queryText: 'trending', sort: 'date' },
   { id: 'music', nameFa: 'موسیقی', nameEn: 'Music', queryText: 'popular music', sort: 'date' },
   { id: 'gaming', nameFa: 'بازی‌ها', nameEn: 'Gaming', queryText: 'gaming highlights', sort: 'date' },
-  { id: 'live', nameFa: 'پخش زنده', nameEn: 'Live', queryText: 'live stream', sort: 'relevance' },
+  // R1: live removed — the single-file byte relay cannot serve HLS/DASH
+  // live manifests; a Live category advertised unplayable content.
   { id: 'cooking', nameFa: 'آشپزی', nameEn: 'Cooking', queryText: 'cooking recipe', sort: 'date' },
   { id: 'news', nameFa: 'اخبار', nameEn: 'News', queryText: 'news today', sort: 'date' },
   { id: 'comedy', nameFa: 'طنز', nameEn: 'Comedy', queryText: 'funny comedy', sort: 'date' },
@@ -260,25 +261,75 @@ function pickHomeCategories(now = Date.now()): Category[] {
   return picked
 }
 
-/** Interleave category batches YouTube-style into one home list. */
+/**
+ * Classified upstream outage (R6): thrown only when EVERY category in a
+ * home refresh fails. Carries the individual per-category failures so the
+ * canonical stale fallback can decide, and so the route surfaces a typed
+ * retryable error instead of a poisoned empty page.
+ */
+export class UpstreamOutageError extends Error {
+  readonly failures: Array<{ categoryId: string; error: unknown }>
+  constructor(failures: Array<{ categoryId: string; error: unknown }>) {
+    super(
+      `All feed categories failed upstream: ` +
+        failures.map((f) => `${f.categoryId}: ${f.error instanceof Error ? f.error.message : String(f.error)}`).join('; ')
+    )
+    this.name = 'UpstreamOutageError'
+    this.failures = failures
+  }
+}
+
+/**
+ * Interleave category batches YouTube-style into one home list (R6).
+ *
+ * Failure semantics:
+ *   - each category outcome is tracked SEPARATELY (never flattened into
+ *     `.catch(() => [])`); usable results are interleaved and deduplicated,
+ *   - when at least one category succeeds the mix is usable (partial
+ *     success),
+ *   - when EVERY category fails, a classified UpstreamOutageError is
+ *     thrown so the canonical stale-if-error fallback activates — an
+ *     outage-produced empty array is never cached for 15 minutes.
+ */
 async function loadHomeBatch(): Promise<TrendingVideo[]> {
   const categories = pickHomeCategories()
-  const batches = await Promise.all(
+  const outcomes = await Promise.allSettled(
     categories.map((category) =>
       loadBatchForQuery(`home:${category.id}`, category.nameEn, category.queryText, category.sort, {
         size: HOME_PER_CATEGORY,
         ttlMs: config.feed.homeTtlMs,
         cachePrefix: 'home'
-      }).catch(() => [] as TrendingVideo[])
+      })
     )
   )
 
+  const batches: TrendingVideo[][] = []
+  const failures: Array<{ categoryId: string; error: unknown }> = []
+  outcomes.forEach((outcome, index) => {
+    if (outcome.status === 'fulfilled') {
+      batches.push(outcome.value)
+    } else {
+      failures.push({ categoryId: categories[index].id, error: outcome.reason })
+    }
+  })
+
+  if (batches.length === 0) {
+    // Every category failed: surface a classified outage (retryable) rather
+    // than caching an empty homepage. The canonical stale fallback in
+    // getHomeFeed handles the rest.
+    throw new UpstreamOutageError(failures)
+  }
+
   const interleaved: TrendingVideo[] = []
+  const seen = new Set<string>()
   const maxLen = Math.max(0, ...batches.map((b) => b.length))
   for (let i = 0; i < maxLen; i++) {
     for (const batch of batches) {
       const video = batch[i]
-      if (video) interleaved.push(video)
+      if (video && !seen.has(video.id)) {
+        seen.add(video.id)
+        interleaved.push(video)
+      }
     }
   }
   return interleaved.slice(0, config.feed.homeBatchSize)
@@ -299,5 +350,10 @@ export async function getHomeFeed(
   const { value } = await loadWithStale(cacheKey, config.feed.homeTtlMs, loadHomeBatch, {
     staleTtlMs: STALE_TTL_MS
   })
+  // R6: a legitimate successful empty home mix (no usable categories at all
+  // after filtering) is cached like any other success — but an OUTAGE never
+  // reaches this line: loadHomeBatch throws before the producer resolves,
+  // so stale-if-error serves the last usable canonical homepage and an
+  // outage never poisons the cache with an empty array.
   return slicePage(value, pageNum, pageLimit)
 }

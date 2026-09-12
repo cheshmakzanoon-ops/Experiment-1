@@ -94,6 +94,29 @@ export interface SelectedStream {
   hasAudio: boolean
   hasVideo: boolean
   formatId: string
+  /** Raw codec identifiers (R1: audio+video must both be explicit, non-"none"). */
+  vcodec?: string
+  acodec?: string
+  /** Estimated total bitrate (kbit/s) when reported — R2 tie-breaker. */
+  tbr?: number
+}
+
+/** Aggregated browser-capability description of one format (R1/R2). */
+export interface FormatFacts {
+  height?: number
+  width?: number
+  vcodec?: string
+  acodec?: string
+  mimeType: string
+  container: string
+  /** True when the transport itself delivers a progressive media file. */
+  supportedTransport: boolean
+  /** True when the container+codec pair is browser-playable. */
+  browserCompatible: boolean
+  tbr?: number
+  formatId: string
+  filesize?: number
+  filesizeApprox?: number
 }
 
 const VIDEO_URL = (videoId: string): string => `https://www.youtube.com/watch?v=${videoId}`
@@ -210,13 +233,53 @@ function isM3u8(f: YtDlpFormat): boolean {
   return protocol.includes('m3u8') || url.includes('.m3u8')
 }
 
+/** Any manifest transport (HLS/DASH) — never masquerades as an MP4 file. */
+function isManifestFormat(f: YtDlpFormat): boolean {
+  const protocol = (f.protocol || '').toLowerCase()
+  const url = (f.url || '').toLowerCase()
+  const ext = (f.ext || '').toLowerCase()
+  return (
+    protocol.includes('m3u8') ||
+    protocol.includes('dash') ||
+    protocol === 'http_dash_segments' ||
+    url.includes('.m3u8') ||
+    url.includes('.mpd') ||
+    ext === 'm3u8' ||
+    ext === 'mpd'
+  )
+}
+
+/** Transports that deliver a real byte-addressable progressive file. */
+function isSupportedTransport(f: YtDlpFormat): boolean {
+  if (isManifestFormat(f)) return false
+  const protocol = (f.protocol || '').toLowerCase()
+  return protocol === '' || protocol === 'https' || protocol === 'http'
+}
+
 function hasVideo(f: YtDlpFormat): boolean {
-  return f.vcodec !== undefined && f.vcodec !== 'none'
+  return f.vcodec !== undefined && f.vcodec !== null && f.vcodec !== 'none' && f.vcodec !== ''
 }
 
 function hasAudio(f: YtDlpFormat): boolean {
-  return f.acodec !== undefined && f.acodec !== 'none'
+  return f.acodec !== undefined && f.acodec !== null && f.acodec !== 'none' && f.acodec !== ''
 }
+
+/**
+ * Browser compatibility (R1): only codec/container pairs Chromium/WebView
+ * actually decode, without external dependencies. Unknown codecs/containers
+ * are NOT assumed compatible — callers must check before offering them.
+ */
+export function formatIsBrowserCompatible(f: YtDlpFormat): boolean {
+  const container = (f.ext || '').toLowerCase()
+  if (!MODERN_BROWSER_CONTAINERS.has(container)) return false
+  const v = (f.vcodec || '').toLowerCase()
+  const a = (f.acodec || '').toLowerCase()
+  const videoOk = !hasVideo(f) || v.startsWith('avc1') || v.startsWith('avc3') || v.startsWith('h264') || v.startsWith('vp8') || v.startsWith('vp9') || v.startsWith('vp09')
+  const audioOk = !hasAudio(f) || a.startsWith('mp4a') || a.startsWith('aac') || a.startsWith('opus') || a.startsWith('vorbis')
+  return videoOk && audioOk
+}
+
+const MODERN_BROWSER_CONTAINERS = new Set(['mp4', 'webm'])
 
 function getMimeType(ext: string): string {
   switch (ext.toLowerCase()) {
@@ -247,16 +310,36 @@ function formatHeight(f: YtDlpFormat): number | undefined {
 
 const MODERN_CONTAINERS = new Set(['mp4', 'webm', 'm4a', 'mkv'])
 
+// Retained for potential diagnostic use; modern container != browser
+// compatibility (R1 checks codecs explicitly via formatIsBrowserCompatible).
 function isModernContainer(f: YtDlpFormat): boolean {
   return MODERN_CONTAINERS.has((f.ext || '').toLowerCase())
 }
 
-function toSelectedStream(f: YtDlpFormat, hasAv: boolean): SelectedStream {
+function formatFacts(f: YtDlpFormat): FormatFacts {
+  const container = (f.ext || '').toLowerCase()
+  return {
+    height: formatHeight(f),
+    width: f.width,
+    vcodec: f.vcodec,
+    acodec: f.acodec,
+    mimeType: getMimeType(container || 'mp4'),
+    container,
+    supportedTransport: isSupportedTransport(f),
+    browserCompatible: formatIsBrowserCompatible(f),
+    tbr: f.tbr,
+    formatId: f.format_id,
+    filesize: f.filesize,
+    filesizeApprox: f.filesize_approx
+  }
+}
+
+function toSelectedStream(f: YtDlpFormat): SelectedStream {
   const height = formatHeight(f)
   return {
     url: f.url as string,
     quality: height ? `${height}p` : f.format_note || 'auto',
-    mimeType: getMimeType(f.ext || 'mp4'),
+    mimeType: getMimeType((f.ext || 'mp4').toLowerCase()),
     // Only an exact `filesize` is authoritative. `filesize_approx` is an
     // estimate: kept aside, never promoted into range decisions,
     // Content-Length, or completion metadata (the proxy learns the true
@@ -265,89 +348,131 @@ function toSelectedStream(f: YtDlpFormat, hasAv: boolean): SelectedStream {
     filesizeApprox: f.filesize_approx,
     height,
     width: f.width,
-    hasAudio: hasAv && hasAudio(f),
-    hasVideo: hasAv && hasVideo(f),
-    formatId: f.format_id
+    hasAudio: hasAudio(f),
+    hasVideo: hasVideo(f),
+    formatId: f.format_id,
+    vcodec: f.vcodec,
+    acodec: f.acodec,
+    tbr: f.tbr
   }
+}
+
+/** Codec families browser-selectable as alternatives (R2 alternatives list). */
+function describeFormat(f: YtDlpFormat): string {
+  const h = formatHeight(f)
+  const v = (f.vcodec || 'unknown').split('.')[0]
+  const a = (f.acodec || 'unknown').split('.')[0]
+  return `${h ? `${h}p` : 'auto'} ${(f.ext || '?').toLowerCase()} v:${v} a:${a}`
 }
 
 /**
- * Pick the single upstream URL to relay. This proxy exists for 1–2 Mbps
- * links and only relays ONE direct URL, so the winner is always a
- * progressive (audio+video in one file) format:
- *   1. highest MP4/WebM combined at or below maxHeight,
- *   2. smallest MP4/WebM combined above maxHeight,
- *   3. legacy containers (3gp/flv) as a last resort,
- *   4. DASH video-only (silent — flagged hasAudio:false).
+ * Pick the single upstream URL to relay (R1 contract).
+ *
+ * This proxy exists for 1–2 Mbps links and relays ONE progressive file.
+ * A normal playable selection requires ALL of:
+ *   - explicit, nonempty audio AND video codec identifiers (neither `none`),
+ *   - a supported direct transport (HLS/DASH manifests are never accepted),
+ *   - a browser-compatible container (mp4/webm),
+ *   - a validated safe media URL (re-checked by streamProxy before caching).
+ *
+ * The requested quality is a HARD CEILING for automatic selection (R2):
+ * when no combined format at or under the cap exists, the caller gets a
+ * structured FORMAT_UNAVAILABLE error carrying sanitized alternatives —
+ * never a silent higher-height pick and never a video-only file.
+ *
+ * Unknown `info.url` fallbacks (no per-format codecs) are never accepted.
  */
 export function selectBestStream(info: YtDlpVideoInfo, maxHeight = 240): SelectedStream {
-  const formats = (info.formats || []).filter(
-    (f) => f && f.url && !isM3u8(f) && f.vcodec !== 'none'
+  const pool = (info.formats || []).filter(
+    (f) =>
+      f &&
+      typeof f.url === 'string' &&
+      f.url.length > 0 &&
+      hasAudio(f) &&
+      hasVideo(f) &&
+      isSupportedTransport(f) &&
+      formatIsBrowserCompatible(f)
   )
 
-  if (formats.length === 0) {
-    if (info.url) {
-      return {
-        url: info.url,
-        quality: 'auto',
-        mimeType: 'video/mp4',
-        hasAudio: true,
-        hasVideo: true,
-        formatId: 'url'
-      }
-    }
-    throw new YtDlpError('No playable formats available for this video', 'format_unavailable')
-  }
+  const underCap = pool.filter((f) => {
+    const h = formatHeight(f)
+    return h !== undefined && h <= maxHeight
+  })
 
-  const pickHighestUnderCap = (pool: YtDlpFormat[]) =>
-    pool
-      .filter((f) => {
-        const h = formatHeight(f)
-        return h !== undefined && h <= maxHeight
-      })
-      .sort((a, b) => (formatHeight(b) as number) - (formatHeight(a) as number))[0]
+  // Highest height at/below the cap; deterministic tie-break on lower
+  // estimated bitrate (height never guarantees throughput on a 1–2 Mbps link).
+  const best =
+    underCap.sort((a, b) => {
+      const dh = (formatHeight(b) as number) - (formatHeight(a) as number)
+      if (dh !== 0) return dh
+      return (a.tbr ?? Infinity) - (b.tbr ?? Infinity)
+    })[0] || null
 
-  const pickSmallestAboveCap = (pool: YtDlpFormat[]) =>
-    pool
-      .filter((f) => {
-        const h = formatHeight(f)
-        return h !== undefined && h > maxHeight
-      })
-      .sort((a, b) => (formatHeight(a) as number) - (formatHeight(b) as number))[0]
+  if (best) return toSelectedStream(best)
 
-  const combined = formats.filter((f) => hasAudio(f))
-  const modernCombined = combined.filter((f) => isModernContainer(f))
-  const withHeight = (pool: YtDlpFormat[]) => pool.filter((f) => formatHeight(f) !== undefined)
+  const alternatives = pool
+    .sort((a, b) => (formatHeight(a) ?? Infinity) - (formatHeight(b) ?? Infinity))
+    .slice(0, 6)
+    .map(describeFormat)
 
-  const candidate =
-    pickHighestUnderCap(withHeight(modernCombined)) ||
-    pickSmallestAboveCap(withHeight(modernCombined)) ||
-    pickHighestUnderCap(withHeight(combined)) ||
-    pickSmallestAboveCap(withHeight(combined))
-
-  if (candidate) {
-    return toSelectedStream(candidate, true)
-  }
-
-  // Video-only DASH fallback (silent — clearly flagged for callers).
-  const videoOnly = withHeight(formats).sort(
-    (a, b) => (formatHeight(a) as number) - (formatHeight(b) as number)
-  )
-  if (videoOnly.length > 0) {
-    const best = videoOnly[0]
-    console.warn(`[ytdlp] ${info.id}: only video-only (DASH) formats available; audio will be absent`)
-    return toSelectedStream(best, false)
-  }
-
-  throw new YtDlpError(`No suitable stream found for ${info.id} (max ${maxHeight}p)`, 'format_unavailable')
+  const message =
+    alternatives.length > 0
+      ? `No combined audio+video format at or below ${maxHeight}p; available alternatives: ${alternatives.join(', ')}`
+      : `No combined audio+video format available for this video (max ${maxHeight}p)`
+  throw new YtDlpError(message, 'format_unavailable')
 }
 
-export interface ExtractionResult {
-  info: YtDlpVideoInfo
-  stream: SelectedStream
+/**
+ * Structured unavailability (R1/R2): `reason` distinguishes "no combined
+ * format at all" from "nothing at/below the requested ceiling"; the
+ * alternatives list is sanitized (no URLs, codecs/heights only).
+ */
+export interface FormatUnavailable {
+  reason: 'no_combined_format' | 'quality_above_cap' | 'no_compatible_container'
+  availableQualities: Array<{ height?: number; label: string; mimeType: string }>
+  selectionReason: string
+}
+
+/**
+ * Aggregate every selectable combined format for the metadata endpoint:
+ * genuinely available, browser-compatible, transport-valid choices only.
+ */
+export function availableCombinedQualities(info: YtDlpVideoInfo): Array<{
+  height?: number
+  label: string
+  mimeType: string
+  formatId: string
+}> {
+  const seen = new Map<number, { height?: number; label: string; mimeType: string; formatId: string }>()
+  for (const f of info.formats || []) {
+    if (!f || typeof f.url !== 'string' || !f.url) continue
+    if (!hasAudio(f) || !hasVideo(f)) continue
+    if (!isSupportedTransport(f) || !formatIsBrowserCompatible(f)) continue
+    const h = formatHeight(f)
+    if (h === undefined) continue
+    const key = h
+    if (!seen.has(key)) {
+      seen.set(key, {
+        height: h,
+        label: `${h}p`,
+        mimeType: getMimeType((f.ext || 'mp4').toLowerCase()),
+        formatId: f.format_id
+      })
+    }
+  }
+  return [...seen.values()].sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
 }
 
 /** Full extraction: raw info + a single selected stream URL. */
+export interface ExtractionResult {
+  info: YtDlpVideoInfo
+  stream: SelectedStream
+  /** Genuinely available combined qualities (metadata additive field). */
+  availableQualities: Array<{ height?: number; label: string; mimeType: string; formatId: string }>
+  /** Why this representation was chosen (stabilized for the UI). */
+  selectionReason: string
+}
+
 export async function extractPlayableVideo(
   videoId: string,
   maxHeight = 240,
@@ -361,8 +486,37 @@ export async function extractPlayableVideo(
     throw new YtDlpError('Live streams are not supported yet', 'live_stream')
   }
 
-  const stream = selectBestStream(info, maxHeight)
-  return { info, stream }
+  let stream: SelectedStream
+  try {
+    stream = selectBestStream(info, maxHeight)
+  } catch (error) {
+    if (error instanceof YtDlpError && error.category === 'format_unavailable') {
+      const pool = (info.formats || []).filter(
+        (f) => f && f.url && hasAudio(f) && hasVideo(f) && isSupportedTransport(f) && formatIsBrowserCompatible(f)
+      )
+      const underCap = pool.some((f) => {
+        const h = formatHeight(f)
+        return h !== undefined && h <= maxHeight
+      })
+      const reason: FormatUnavailable['reason'] = underCap
+        ? 'no_compatible_container'
+        : pool.length > 0
+          ? 'quality_above_cap'
+          : 'no_combined_format'
+      const enriched = new YtDlpError(error.message, 'format_unavailable', {
+        originalError: error
+      }) as unknown as YtDlpError & FormatUnavailable
+      enriched.reason = reason
+      enriched.availableQualities = availableCombinedQualities(info)
+      enriched.selectionReason = reason
+      throw enriched
+    }
+    throw error
+  }
+
+  const availableQualities = availableCombinedQualities(info)
+  const selectionReason = `combined:${stream.formatId}:${stream.height ? `${stream.height}p` : 'auto'}`
+  return { info, stream, availableQualities, selectionReason }
 }
 
 function videoFormatFromStream(stream: SelectedStream): VideoFormat {
@@ -376,6 +530,8 @@ function videoFormatFromStream(stream: SelectedStream): VideoFormat {
     height: stream.height,
     width: stream.width,
     formatId: stream.formatId,
+    vcodec: stream.vcodec,
+    acodec: stream.acodec,
     ext: undefined
   }
 }
@@ -386,7 +542,11 @@ export async function extractVideoInfo(
   maxHeight = 240,
   options: { signal?: AbortSignal } = {}
 ): Promise<VideoMetadata> {
-  const { info, stream } = await extractPlayableVideo(videoId, maxHeight, options)
+  const { info, stream, availableQualities, selectionReason } = await extractPlayableVideo(
+    videoId,
+    maxHeight,
+    options
+  )
 
   return {
     id: info.id,
@@ -399,7 +559,16 @@ export async function extractVideoInfo(
     viewCount: info.view_count || 0,
     uploadDate: info.upload_date || '',
     streamUrl: stream.url,
-    formats: [videoFormatFromStream(stream)]
+    formats: [videoFormatFromStream(stream)],
+    // ---- R2 additive metadata (never removes existing fields) ----
+    requestedQuality: `${maxHeight}p`,
+    actualQuality: stream.quality,
+    hasAudio: stream.hasAudio,
+    hasVideo: stream.hasVideo,
+    mimeType: stream.mimeType,
+    codecs: { video: stream.vcodec, audio: stream.acodec },
+    availableQualities,
+    selectionReason
   }
 }
 

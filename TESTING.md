@@ -17,15 +17,50 @@ server is running (see README → Quick start). Two distinct phases:
 
 ---
 
-## Experiment-1 reliability remediation — active packet
+## Experiment-1 reliability remediation — active packet (R1–R6, parents-first)
 
-> Single durable execution ledger for the reliability-remediation
-> assignment. Replace this packet's contents in place as stages complete;
-> keep the active context around 800–1,200 words and put durable executed
-> results in the table below the packet. Do not append repeated plans or
-> full logs here.
+> Single durable execution ledger. Replace in place; durable executed results
+> live in the append-only tables below the packet. Historical pre-R1 evidence
+> is preserved further down and in the tables.
 
-**Baseline SHA and current branch:** `f898e3f7c12bd62b02609d1b50357c23093d9adb` on `main` (origin `https://github.com/cheshmakzanoon-ops/Experiment-1.git`, single worktree at repo root, HEAD == audit SHA at assignment start).
+**Baseline SHA and current branch:** `71f152159cd22f445e4cec6266239f495b6333d2` on `main` (origin `https://github.com/cheshmakzanoon-ops/Experiment-1.git`, credentials managed by Freebuff — never embedded in the remote URL).
+
+**Baseline gate results (executed 2026-09-11, before any production edit):**
+`npm run lint` exit 0 · `npm run typecheck` exit 0 · `npm run build` exit 0 (prebuild regenerated `src/frontend/js/shell-manifest.js`, `git status --short` after build: clean — no diff) · `npm test` exit 0 — **21 files / 235 tests** · `npm run test:browser` exit 0 — **5/5** (Playwright 1.49.1 headless Chromium). Node v22.23.1, npm 10.9.8.
+
+**Pre-existing dirty paths:** none (clean tree at baseline).
+
+**Issue ledger R1–R6 (current invariant → status):**
+- R1 never deliver silent video as success; strict combined-format selection; live cards removed — LOCAL_REPAIRS_VERIFIED (`safeFailureFixed: true`)
+- R2 requested quality is a hard ceiling; truthful additive metadata — LOCAL_REPAIRS_VERIFIED
+- R3 explicit player states; startup budget 120 s watched from real progress — LOCAL_REPAIRS_VERIFIED
+- R4 one `replaceSourcePreservingState` helper; position kept on every recovery — LOCAL_REPAIRS_VERIFIED
+- R5 bounded JSON body deadlines in `api.js`; bounded shell caching in `sw.js`; CSP-safe SW registration — LOCAL_REPAIRS_VERIFIED
+- R6 feed failures classified (never error-erasing `catch(() => [])`); canonical stale homepage — LOCAL_REPAIRS_VERIFIED
+
+**Files changed this stage:**
+`src/services/youtube/extractor.ts` · `src/types/video.ts` · `src/routes/videoRoutes.ts` · `src/middleware/streamCache.ts` · `src/services/youtube/streamProxy.ts` · `src/services/youtube/trendingService.ts` · `src/frontend/js/services/feedService.js` (live chip) · `src/frontend/js/components/videoCard.js` (live-card guard) · `src/frontend/js/components/videoPlayer.js` (R3/R4) · `src/frontend/js/api.js` (R5) · `src/frontend/js/services/searchService.js` · `src/frontend/js/services/offlineService.js` (401 opens gate) · `src/frontend/sw.js` (R5 bounded bodies) · `src/frontend/js/app.js` (SW probe no longer disabled by strict CSP) · `src/frontend/js/shell-manifest.js` (regenerated: `sh-94bc43fb99dcd74a`) · NEW: `tests/playback-selection.test.ts` · `tests/frontend-deadlines.test.mjs` · `tests/browser/playbackReliability.spec.mjs` · `tests/browser/serviceWorkerReliability.spec.mjs` · `tests/browser/fixtureServer.mjs` (extended, default behavior preserved) · `tests/feeds.test.ts` (extended)
+
+**Current failing regression:** none — see final gates below.
+
+**Last commands / exits:** `npm run lint` 0 · `npm run typecheck` 0 · `npm run build` 0 (manifest `sh-94bc43fb99dcd74a`) · `npx vitest run` 0 — **23 files / 270 tests** · `npx playwright test` 0 — **13/13** · timing suites ×3: 42/42 each run (deadlines + selection + feeds).
+
+**Next three actions:** (1) commit task-owned paths on `main`; (2) operator deploys to Freebuff + smoke (`scripts/smoke.mjs`); (3) parents-gate evidence on real devices/network (below).
+
+**Ledger fields (R1 mandate):** `safeFailureFixed: true` — unsafe success paths removed (video-only fallback, invented-codec `info.url`, manifest-as-MP4) with regressions green. `playableCoverageVerified: false` — representative ordinary videos NOT yet verified through an actual deployment with sound+picture; remains BLOCKED until the external gate runs. No external deployment URL exists in this sandbox → never fabricated.
+
+**External blockers (unchanged in kind):** no deployed household URL / no Iranian device or network in this sandbox → Iran gate BLOCKED (never PASS). No ffmpeg in the environment → the browser specs use a structural WebM stub plus in-page `canPlayType` capability probes and explicitly record the MEDIA_FIXTURE evidence gap; real-decode 20-minute/seek/quality-position viewing evidence belongs to the external parents gate.
+
+**R1–R6 verification map (all executed on this checkout):**
+- R1/R2: `tests/playback-selection.test.ts` — 18/18 (combined-only selection, video-only+audio-only rejection, missing-codec rejection, HLS/DASH rejection, ts-container rejection, live rejection, cache non-revival, 144-vs-360 ceiling, sanitized alternatives, deterministic bitrate tie-break, additive metadata agreement, sanitized availableQualities).
+- R6: `tests/feeds.test.ts` — 13/13 (all-fail → `UpstreamOutageError`, no poisoned empty cache + immediate recovery, warm-stale canonical, one-category success, dedupe, beyond-batch `hasMore:false`).
+- R5 JSON/auth: `tests/frontend-deadlines.test.mjs` — 11/11 against REAL hanging HTTP servers (stalled/partial body finite timeout, oversized pre-read rejection, malformed typed nonretryable, Retry-After 60 surfaced not shortened, bounded session/login, gate pre-abort + caller-cancellation).
+- R5 SW: `tests/browser/serviceWorkerReliability.spec.mjs` — 4/4 (shipped worker registers+controls under production-equivalent CSP, generation cached, held-body navigation rescued by cached shell, no `/api/stream/` in any cache).
+- R3/R4: `tests/browser/playbackReliability.spec.mjs` — 4/4 (rapid A→B generation fencing, paused-stays-paused, close invalidates generation, close during pending startup shows no false failure).
+
+**Final response contract:** separate `LOCAL_REPAIRS_VERIFIED` (this checkout, all gates green) from `PARENTS_READY` (BLOCKED — requires deployed URL, household session, representative corpus incl. Persian speech/music/cooking/interviews/short/long, real 1–2 Mbps link, sound+picture evidence).
+
+**External blockers:** no deployed household URL / no Iranian device or network in this sandbox → Iran gate BLOCKED (never PASS). No browser-media fixture generator (no ffmpeg) → R4 20-minute audiovisual browser assertions must use whatever valid tiny fixture the environment permits or be recorded as a specific evidence gap.
 
 **Baseline gate results (executed, before any production edit):**
 `npm ci --include=dev` exit 0 · `npm run lint` exit 0 · `npm run typecheck` exit 0 · `npm run build` exit 0 (prebuild regenerated `src/frontend/js/shell-manifest.js`, diff reviewed, no unintended content change) · `npm test` exit 0 — **17 files / 204 tests passed**. Node v22.23.1, npm 10.9.8. Pre-existing dirty paths: none (clean `git status --short` before any work).

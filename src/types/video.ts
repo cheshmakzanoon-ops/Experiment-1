@@ -10,6 +10,19 @@ export interface VideoMetadata {
   uploadDate: string
   streamUrl?: string
   formats?: VideoFormat[]
+  // ---- R2 additive playback-truth metadata (never removes old fields) ----
+  /** Quality the viewer asked for, e.g. "240p". */
+  requestedQuality?: string
+  /** Quality actually selected by the server (hard-capped by requested). */
+  actualQuality?: string
+  hasAudio?: boolean
+  hasVideo?: boolean
+  mimeType?: string
+  codecs?: { video?: string; audio?: string }
+  /** Genuinely selectable combined qualities for this video. */
+  availableQualities?: Array<{ height?: number; label: string; mimeType: string; formatId?: string }>
+  /** Stabilized reason this representation was chosen. */
+  selectionReason?: string
 }
 
 export interface VideoFormat {
@@ -24,6 +37,9 @@ export interface VideoFormat {
   width?: number
   formatId?: string
   ext?: string
+  /** Raw codec identifiers (R1: explicit, never guessed). */
+  vcodec?: string
+  acodec?: string
 }
 
 export interface SearchResult {

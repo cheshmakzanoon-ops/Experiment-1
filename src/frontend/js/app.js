@@ -157,20 +157,16 @@ let shellReloadArmed = false;
 
 function registerServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
-    if (typeof Worker !== 'undefined') {
-        try {
-            // Capability probe: module workers need import() support. The
-            // blob worker terminates immediately; nothing is fetched.
-            new Worker(
-                URL.createObjectURL(
-                    new Blob(['self.registration;'], { type: 'text/javascript' })
-                ),
-                { type: 'module' }
-            ).terminate();
-        } catch {
-            console.warn('[sw] module workers unsupported — staying online-only');
-            return;
-        }
+    // Module-worker capability is decided by the REGISTRATION itself, not by
+    // a blob-worker probe: a CSP that legitimately forbids blob: scripts
+    // (script-src 'self' without blob:) made the old probe throw and the
+    // catch disabled the real service worker too (R5). Attempting the real
+    // registration keeps every unsupported-browser outcome identical (the
+    // register promise rejects → warn → stay online-only) while a strict CSP
+    // no longer breaks offline support.
+    if (typeof Worker === 'undefined') {
+        console.warn('[sw] workers unsupported — staying online-only');
+        return;
     }
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         void registerSw();

@@ -37,6 +37,10 @@ export interface ResolvedStreamSource {
   hasAudio: boolean
   hasVideo: boolean
   formatId: string
+  /** Raw codec identifiers (R1/R2: tracked internally, never re-guessed). */
+  vcodec?: string
+  acodec?: string
+  tbr?: number
   title: string
   author: string
   duration: number
@@ -75,6 +79,9 @@ async function extractSource(
     hasAudio: stream.hasAudio,
     hasVideo: stream.hasVideo,
     formatId: stream.formatId,
+    vcodec: stream.vcodec,
+    acodec: stream.acodec,
+    tbr: stream.tbr,
     title: info.title || '',
     author: info.uploader || info.channel || '',
     duration: info.duration || 0,
@@ -101,6 +108,9 @@ function fromCacheEntry(videoId: string, maxHeight: number, entry: StreamCacheEn
     hasAudio: entry.hasAudio,
     hasVideo: entry.hasVideo,
     formatId: entry.formatId,
+    vcodec: entry.vcodec,
+    acodec: entry.acodec,
+    tbr: entry.tbr,
     title: entry.title,
     author: entry.author,
     duration: entry.duration,
